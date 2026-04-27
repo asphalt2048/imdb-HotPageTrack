@@ -26,7 +26,6 @@ struct RecordLoc{
                 size_t disk_offset;
             }; // total 16 bytes **try to keep it small!**
             uint32_t size; // 4 bytes
-            uint8_t size_class; // 1 bytes
             bool is_in_ram; // 1 byte
             // 2 bytes compiler padding
         }in_use;
@@ -54,8 +53,11 @@ class StorageEngine{
     private:
         Arena arena;
 
-        /* V0.1 test. Statically define the only size class 64 */
-        SizeClassManager scm_64;
+        /* Recordheader is 8 bytes. Record >= 512B is managed by LargeRecordManager.
+         * SCMs ranging from 16 bytes to 256 bytes.
+         * 16, 32, 64, 128, 256
+         */
+        SizeClassManager SCMs[5];
 
         /* logical id generator, also serves as first_free_idx in translation table */
         uint64_t next_logical_id;
@@ -67,11 +69,12 @@ class StorageEngine{
         
         std::unordered_map<std::string, uint64_t> hashmap;
 
-        /* first arg must be slot-aligned */
-        void mark_slot_hot_dynamic(void* slot_addr, uint8_t size_class);
+        /* get the idx of corresponding SCM by size */
+        uint8_t get_scm_index(size_t total_size);
 
-        /* on success, return the inserted data's id */
+        /* on success, return the inserted data's logical id */
         uint64_t add_to_table(const RecordLoc& new_loc);
+        
         void remove_from_table(uint64_t logical_id);
         /* grow the table by factor table_grow_speed */
         void grow_table();

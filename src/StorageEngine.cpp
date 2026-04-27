@@ -1,18 +1,29 @@
 #include "StorageEngine.h"
 
+/*------------------------ctor/dtor-----------------------------*/
+
 namespace imdb{
-StorageEngine::StorageEngine():next_logical_id(0), scm_64(64, arena), table_grow_speed(2){
+StorageEngine::StorageEngine():next_logical_id(0), table_grow_speed(2), 
+    SCMs{ {16, arena}, {32, arena}, {64, arena}, {128, arena}, {256, arena} }
+{
     translation_table.resize(10000);
     for(int i = 0; i<10000-1; i++){ translation_table[i].next_free_idx = i + 1; }
     translation_table[9999].next_free_idx = TABLE_END;
 }
 
+/*------------------------Helper Functions------------------------*/
 
-void StorageEngine::mark_slot_hot_dynamic(void* slot_addr, uint8_t size_class){
-    // TODO: overflow in 32 bit system?
-    size_t slot_size = (1ULL << size_class);
-    mark_slot_hot(slot_addr);
+uint8_t StorageEngine::get_scm_index(uint64_t total_size) {
+    if (total_size <= 16) return 0;
+    if (total_size <= 32) return 1;
+    if (total_size <= 64) return 2;
+    if (total_size <= 128) return 3;
+    if (total_size <= 256) return 4;
+    
+    return 255; // Error/Too large
 }
+
+/*-------------------Translationn table related----------------------*/
 
 uint64_t StorageEngine::add_to_table(const RecordLoc& new_loc){
     if(next_logical_id == TABLE_END) grow_table();
@@ -42,10 +53,13 @@ void StorageEngine::grow_table(){
     next_logical_id = old_size;
 }
 
+/*--------------------------Interface-------------------------------*/
+
 bool StorageEngine::put(const std::string& key, const char* record, uint64_t record_size){
-    /* V0.1 test: only support 64 byte size class */
-    if(record_size > 64 - sizeof(RecordHeader)){
-        std::cerr<<RED<<"V0.1 test: only 64 byte size class supported\n"<<RESET;
+    size_t real_size = record_size + sizeof(RecordHeader);
+    if(real_size > 256){
+        // TODO: large record manager
+        std::cerr<<RED<<"Out of bound\n"<<RESET;
         return false;
     }
 
@@ -53,19 +67,46 @@ bool StorageEngine::put(const std::string& key, const char* record, uint64_t rec
     /* case 1: record exists, update the record */
     if(it != hashmap.end()){
         uint64_t logical_id = it->second;
-        RecordLoc& loc = translation_table[logical_id]; // take a reference
+        RecordLoc& loc = translation_table[logical_id];
+
         /* case 1.1: record is in ram */
         if(loc.in_use.is_in_ram){
-            // TODO: support update that changes size class
+            void* slot_addr = loc.in_use.ram_addr;
+            size_t old_size = get_struct_page(slot_addr)->header.slot_size;
 
-            RecordHeader* header = reinterpret_cast<RecordHeader*>(loc.in_use.ram_addr);
-            char* payload = header->get_payload();
-            std::memcpy(payload, record, record_size);
+            /* case 1.1.1: New data fits in the existing slot. Update in-place. */
+            if( real_size <= old_size){
+                RecordHeader* header = reinterpret_cast<RecordHeader*>(slot_addr);
+                char* payload = header->get_payload();
+                std::memcpy(payload, record, record_size);
 
-            loc.in_use.size = record_size;
-            mark_slot_hot_dynamic(loc.in_use.ram_addr, loc.in_use.size_class);
+                loc.in_use.size = record_size;
+                mark_slot_hot(slot_addr);
 
-            return true;
+                return true;
+            }
+            /* case 1.1.2: New data outgrows the current slot. Reallocate. */
+            else{
+                SizeClassManager &scm = SCMs[get_scm_index(real_size)];
+                void* new_slot = scm.alloc();
+
+                // Set up new header and payload
+                RecordHeader* new_header = reinterpret_cast<RecordHeader*>(new_slot);
+                new_header->logical_id = logical_id;
+                std::memcpy(new_header->get_payload(), record, record_size);
+
+                // Free old slot
+                SizeClassManager &old_scm = SCMs[get_scm_index(old_size)];
+                old_scm.free(slot_addr);
+                mark_slot_cold(slot_addr);
+
+                // Update translation table
+                loc.in_use.ram_addr = new_slot;
+                loc.in_use.size = record_size;
+                
+                mark_slot_hot(new_slot);
+                return true;
+            }
         }
         /* case 1.2: record is in disk */
         else{
@@ -75,16 +116,15 @@ bool StorageEngine::put(const std::string& key, const char* record, uint64_t rec
     }
     /* case 2: record doesn't exist insert a new one */
     else{
-        // TODO: support other sized record
-        void* slot_addr = scm_64.alloc();
+        /* Don't foeget to take header into account */
+        SizeClassManager &scm = SCMs[get_scm_index(record_size+sizeof(RecordHeader))];
+        void* slot_addr = scm.alloc();
 
         /* update the translation table */
         RecordLoc new_loc;
         new_loc.in_use.is_in_ram = true;
         new_loc.in_use.size = record_size;
         new_loc.in_use.ram_addr = slot_addr;
-        // TODO: change this
-        new_loc.in_use.size_class = 6;
 
         uint64_t logical_id = add_to_table(new_loc);
         hashmap[key] = logical_id;
@@ -96,7 +136,7 @@ bool StorageEngine::put(const std::string& key, const char* record, uint64_t rec
         char* payload = header->get_payload();
         std::memcpy(payload, record, record_size);
 
-        mark_slot_hot_dynamic(slot_addr, new_loc.in_use.size_class);
+        mark_slot_hot(slot_addr);
 
         return true;
     }
@@ -116,7 +156,7 @@ bool StorageEngine::get(const std::string& key, char* buf, uint64_t& record_size
         std::memcpy(buf, payload, loc.in_use.size);
         record_size = loc.in_use.size;
 
-        mark_slot_hot_dynamic(loc.in_use.ram_addr, loc.in_use.size_class);
+        mark_slot_hot(loc.in_use.ram_addr);
 
         return true;
     }
@@ -131,7 +171,20 @@ bool StorageEngine::del(const std::string& key){
     if(it == hashmap.end()) {std::cerr<<RED<<"Delete record with key: "<<key<<" error: record not exists\n"<<RESET; return false;}
 
     uint64_t logical_id = it->second;
-    scm_64.free(translation_table[logical_id].in_use.ram_addr);
+    RecordLoc &loc = translation_table[logical_id];
+
+    /* record is in ram, delete directly */
+    if (loc.in_use.is_in_ram) {
+        void* slot_addr = loc.in_use.ram_addr;
+        Page* page = get_struct_page(slot_addr);
+        size_t slot_size = page->header.slot_size;
+
+        SCMs[get_scm_index(slot_size)].free(slot_addr);
+    } 
+    /* record is in disk, logical delete */
+    else{
+        // TODO: Logical deletion for on-disk records (tombstoning)
+    }
 
     remove_from_table(logical_id);
     hashmap.erase(it);

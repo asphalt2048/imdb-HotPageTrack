@@ -30,7 +30,7 @@ struct Page{
 
         uint16_t slot_size;
         uint16_t max_slots; // dynamically set by init_page()
-        uint16_t in_use;    // counter of in-use slots
+        uint16_t used;    // counter of in-use slots
 
         /* The size header takes. Calculated dynamically at init_page() */
         uint16_t header_reserved;
@@ -46,7 +46,7 @@ struct Page{
     inline char* get_slot_addr(uint16_t idx){
         return reinterpret_cast<char*>(this) + header.header_reserved + (idx * header.slot_size);
     }
-    /* slots in managed by internal free list. This function returns the pointer to the "next_free" pointer in a slot */
+    /* slots in managed by internal free list. This function returns the reference to the "next_free" pointer in a slot */
     inline uint16_t& next_free(uint16_t idx){
         return *reinterpret_cast<uint16_t*>(get_slot_addr(idx));
     }
@@ -85,6 +85,10 @@ class SizeClassManager{
         void free(void* raw_addr);
 };
 
-/* helper function. It's not bind to a size class(not a member funtion) for flexibilty reasons */
+/* helper function. The functions are not a member of SCM for flexibilty reasons */
 void mark_slot_hot(void* slot_addr);
+void mark_slot_cold(void* slot_addr);
+/* helper function. Input: addr of a slot. Output: struct page the slot belonging to */
+Page* get_struct_page(void* slot_addr);
+
 }// namespace imdb

@@ -46,7 +46,7 @@ void SizeClassManager::return_a_page_to_arena(Page* page){
 Page* SizeClassManager::init_page(void* raw_page_base){
     Page* page = reinterpret_cast<Page*>(raw_page_base);
     page->header.first_free_idx = 0;
-    page->header.in_use = 0;
+    page->header.used = 0;
     page->header.next = nullptr;
     page->header.prev = nullptr;
     page->header.page_id = arena.get_page_id(raw_page_base);
@@ -83,9 +83,9 @@ void* SizeClassManager::alloc(){
 
     uint16_t slot_idx = page->header.first_free_idx;
     page->header.first_free_idx = page->next_free(slot_idx);
-    page->header.in_use++;
+    page->header.used++;
 
-    if(page->header.in_use == page->header.max_slots){
+    if(page->header.used == page->header.max_slots){
         remove_from_partial_list(page);
     }
 
@@ -106,20 +106,24 @@ void SizeClassManager::free(void* raw_addr){
     page->next_free(slot_idx) = page->header.first_free_idx;
     page->header.first_free_idx = slot_idx;
 
-    if(page->header.in_use == page->header.max_slots){
+    /* if page becomes partial, put to partial list */
+    if(page->header.used == page->header.max_slots){
         push_to_partial_list(page);
     }
 
-    page->header.in_use--;
+    page->header.used--;
 
-    if(page->header.in_use == 0){
+    /* if page becomes empty, return it to the arena */
+    if(page->header.used == 0){
         return_a_page_to_arena(page);
     }
 
     return;
 }
 
-/* helper function. It's not bind to a size class(not a member funtion) for flexibilty reasons */
+/*-------------------------Helper functions---------------------------------------*/
+/* They are not bind to a size class(not a member funtion) for flexibilty reasons */
+
 void mark_slot_hot(void* slot_addr){
     uintptr_t slot_addr_ = reinterpret_cast<uintptr_t>(slot_addr);
     uintptr_t page_base = PAGE_ALIGN(slot_addr_);
@@ -133,4 +137,25 @@ void mark_slot_hot(void* slot_addr){
 
     page->is_hot[arr_idx] |= (1ULL << bit_idx);
 };
+
+void mark_slot_cold(void* slot_addr){
+    uintptr_t slot_addr_ = reinterpret_cast<uintptr_t>(slot_addr);
+    uintptr_t page_base = PAGE_ALIGN(slot_addr_);
+
+    Page* page = reinterpret_cast<Page*>(page_base);
+
+    uint16_t slot_id = ((slot_addr_-page_base) - page->header.header_reserved) / page->header.slot_size;
+
+    size_t arr_idx = slot_id / 64;
+    size_t bit_idx = slot_id % 64;
+
+    page->is_hot[arr_idx] &= ~(1ULL << bit_idx);
+};
+
+Page* get_struct_page(void* slot_addr){
+    uintptr_t slot_addr_ = reinterpret_cast<uintptr_t>(slot_addr);
+    uintptr_t page_base = PAGE_ALIGN(slot_addr_);
+
+    return reinterpret_cast<Page*>(page_base);
+}
 }// namespace imdb
