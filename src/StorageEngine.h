@@ -55,7 +55,7 @@ class StorageEngine{
         Arena arena;
 
         /* V0.1 test. Statically define the only size class 64 */
-        SizeClassManager<64> scm_64;
+        SizeClassManager scm_64;
 
         /* logical id generator, also serves as first_free_idx in translation table */
         uint64_t next_logical_id;

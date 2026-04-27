@@ -1,7 +1,7 @@
 #include "StorageEngine.h"
 
 namespace imdb{
-StorageEngine::StorageEngine():next_logical_id(0), scm_64(arena), table_grow_speed(2){
+StorageEngine::StorageEngine():next_logical_id(0), scm_64(64, arena), table_grow_speed(2){
     translation_table.resize(10000);
     for(int i = 0; i<10000-1; i++){ translation_table[i].next_free_idx = i + 1; }
     translation_table[9999].next_free_idx = TABLE_END;
@@ -11,15 +11,7 @@ StorageEngine::StorageEngine():next_logical_id(0), scm_64(arena), table_grow_spe
 void StorageEngine::mark_slot_hot_dynamic(void* slot_addr, uint8_t size_class){
     // TODO: overflow in 32 bit system?
     size_t slot_size = (1ULL << size_class);
-    switch (slot_size)
-    {
-    // TODO: other size class
-    case 64:
-        mark_slot_hot<64>(slot_addr);
-        break;
-    default:
-        break;
-    }
+    mark_slot_hot(slot_addr);
 }
 
 uint64_t StorageEngine::add_to_table(const RecordLoc& new_loc){
