@@ -5,11 +5,13 @@
 #include <unordered_map>
 #include <string>
 #include <cstring>
+#include <shared_mutex>
 #include "SizeClass.h"
+#include "DiskManager.h"
+#include "Sweeper.h"
 
 namespace imdb{
 #define TABLE_END  0XFFFFFFFFFFFFFFFF
-
 /* strcut RecordLoc(record location). Content in the translation table. 
  *
  * Record lookup is like: 
@@ -27,7 +29,7 @@ struct RecordLoc{
             }; // total 16 bytes **try to keep it small!**
             uint32_t size; // 4 bytes
             bool is_in_ram; // 1 byte
-            // 2 bytes compiler padding
+            // 3 bytes compiler padding
         }in_use;
 
         uint64_t next_free_idx;
@@ -52,7 +54,7 @@ struct RecordHeader{
 class StorageEngine{
     private:
         Arena arena;
-
+        EvictionSweeper sweeper;
         /* Recordheader is 8 bytes. Record >= 512B is managed by LargeRecordManager.
          * SCMs ranging from 16 bytes to 256 bytes.
          * 16, 32, 64, 128, 256
@@ -62,19 +64,20 @@ class StorageEngine{
         /* logical id generator, also serves as first_free_idx in translation table */
         uint64_t next_logical_id;
         /* translation table, bridge hashmap and record location. See comment at struct RecordLoc */
-        /* TODO: in far future, dynamically re-size the table according to record counts*/
         std::vector<RecordLoc> translation_table;
         /* How much the table grow when it bocomes full: new_size = old_size*table_grow_speed. default 2. */
         uint8_t table_grow_speed;
         
+        /* tracks key -> translation_table index mappings */
         std::unordered_map<std::string, uint64_t> hashmap;
+
+        std::shared_mutex rw_lock;
+        void evict_cold_page();
 
         /* get the idx of corresponding SCM by size */
         uint8_t get_scm_index(size_t total_size);
 
-        /* on success, return the inserted data's logical id */
-        uint64_t add_to_table(const RecordLoc& new_loc);
-        
+        uint64_t add_to_table(const RecordLoc& new_loc); // on success, return the inserted data's logical id
         void remove_from_table(uint64_t logical_id);
         /* grow the table by factor table_grow_speed */
         void grow_table();

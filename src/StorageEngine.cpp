@@ -3,15 +3,16 @@
 /*------------------------ctor/dtor-----------------------------*/
 
 namespace imdb{
-StorageEngine::StorageEngine():next_logical_id(0), table_grow_speed(2), 
-    SCMs{ {16, arena}, {32, arena}, {64, arena}, {128, arena}, {256, arena} }
+StorageEngine::StorageEngine():next_logical_id(0), table_grow_speed(2),
+    SCMs{{16, arena}, {32, arena}, {64, arena}, {128, arena}, {256, arena}},
+    sweeper(arena, [this](){this->evict_cold_page();})
 {
     translation_table.resize(10000);
     for(int i = 0; i<10000-1; i++){ translation_table[i].next_free_idx = i + 1; }
     translation_table[9999].next_free_idx = TABLE_END;
 }
 
-/*------------------------Helper Functions------------------------*/
+/*------------------------------------Helper Functions---------------------------------------*/
 
 uint8_t StorageEngine::get_scm_index(uint64_t total_size) {
     if (total_size <= 16) return 0;
@@ -23,7 +24,7 @@ uint8_t StorageEngine::get_scm_index(uint64_t total_size) {
     return 255; // Error/Too large
 }
 
-/*-------------------Translationn table related----------------------*/
+/*---------------------------------Translationn table related----------------------------------*/
 
 uint64_t StorageEngine::add_to_table(const RecordLoc& new_loc){
     if(next_logical_id == TABLE_END) grow_table();
@@ -53,9 +54,18 @@ void StorageEngine::grow_table(){
     next_logical_id = old_size;
 }
 
-/*--------------------------Interface-------------------------------*/
+/*-----------------------------------------Eviction logic----------------------------------------*/
+void StorageEngine::evict_cold_page(){
+
+}
+
+/*-----------------------------------------Interface---------------------------------------------*/
+
+/* TODO: for V1.0, global lock is used. */
 
 bool StorageEngine::put(const std::string& key, const char* record, uint64_t record_size){
+    std::unique_lock<std::shared_mutex> write_lock(rw_lock);
+    
     size_t real_size = record_size + sizeof(RecordHeader);
     if(real_size > 256){
         // TODO: large record manager
@@ -143,6 +153,8 @@ bool StorageEngine::put(const std::string& key, const char* record, uint64_t rec
 }
 
 bool StorageEngine::get(const std::string& key, char* buf, uint64_t& record_size){
+    std::shared_lock<std::shared_mutex> read_lock(rw_lock);
+
     auto it = hashmap.find(key);
     if(it == hashmap.end()) {std::cerr<<RED<<"Get record with key: "<<key<<" error: record not exists\n"<<RESET; return false;}
 
@@ -167,6 +179,8 @@ bool StorageEngine::get(const std::string& key, char* buf, uint64_t& record_size
 }
 
 bool StorageEngine::del(const std::string& key){
+    std::unique_lock<std::shared_mutex> write_lock(rw_lock);
+
     auto it = hashmap.find(key);
     if(it == hashmap.end()) {std::cerr<<RED<<"Delete record with key: "<<key<<" error: record not exists\n"<<RESET; return false;}
 
