@@ -42,6 +42,8 @@ void* Arena::alloc_a_page_nocheck(){
             size_t page_id = 64*idx + free_bit;
             uintptr_t page_base_addr  = reinterpret_cast<uintptr_t>(arena_base) + page_id*PAGE_SIZE;
 
+            used_pages.fetch_add(1);
+            
             return reinterpret_cast<void *>(page_base_addr);
         }
         else{
@@ -65,7 +67,6 @@ void* Arena::alloc_a_page(){
         std::cerr<<RED<<"OOM: Page alloc failed\n"<<RESET;
         exit(-1);
     }
-    used_pages.fetch_add(1);
     /* Don't hold any mutex here. 
      * Might suffer a lost wakeup(needs_sweeping is true, but no sweeper awaken),
      * but following alloc_a_page will wake up one eventually.
@@ -164,6 +165,9 @@ void* Arena::get_lru_tail(){
 /*-------------------------Helper functions---------------------------------------*/
 /* They are not bind to a size class(not a member funtion) for flexibilty reasons */
 
+// TODO: lock free or not? Does user need to hold lock when calling this function?
+// (this is a write to page, a write need a lock)
+// false positive acceptive?
 void mark_slot_hot(void* slot_addr){
     uintptr_t slot_addr_ = reinterpret_cast<uintptr_t>(slot_addr);
     uintptr_t page_base = PAGE_ALIGN(slot_addr_);
@@ -178,6 +182,8 @@ void mark_slot_hot(void* slot_addr){
     page->is_hot[arr_idx] |= (1ULL << bit_idx);
 };
 
+// TODO: lock free or not? Does user need to hold lock when calling this function?
+// (this is a write to page, a write need a lock)
 void mark_slot_cold(void* slot_addr){
     uintptr_t slot_addr_ = reinterpret_cast<uintptr_t>(slot_addr);
     uintptr_t page_base = PAGE_ALIGN(slot_addr_);

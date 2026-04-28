@@ -71,6 +71,8 @@ void StorageEngine::evict_cold_page(){
     // Get the coldest page from the Arena
     Page* victim_page = reinterpret_cast<Page*>(arena.get_lru_tail());
     if (!victim_page) return;
+
+    // TODO: implement hot rescue
     // Scan every slot on the page
     for (uint16_t i = 0; i < victim_page->header.max_slots; i++) {
         char* slot_addr = victim_page->get_slot_addr(i);
@@ -96,7 +98,7 @@ void StorageEngine::evict_cold_page(){
     }
     // ===================================================================== TODO: lock 2 for phrase 2
     uint8_t scm_idx = get_scm_index(victim_page->header.slot_size);
-    SCMs[scm_idx].reclaim_evicted_page(victim_page);
+    SCMs[scm_idx].reclaim_evicted_page(victim_page); // TODO: can we make this lock-free?
 }
 
 /*-----------------------------------------Interface---------------------------------------------*/
@@ -133,9 +135,9 @@ bool StorageEngine::put(const std::string& key, const char* record, uint64_t rec
             /* case 1.1.1: New data fits in the existing slot. Update in-place. */
             if( real_size <= old_size){
                 init_slot_nocheck(slot_addr, logical_id, record, record_size);
+                mark_slot_hot(slot_addr);
 
                 loc.in_use.size = record_size;
-                mark_slot_hot(slot_addr);
                 return true;
             }
             /* case 1.1.2: New data outgrows the current slot. Reallocate. */
@@ -145,6 +147,7 @@ bool StorageEngine::put(const std::string& key, const char* record, uint64_t rec
 
                 // Set up new header and payload
                 init_slot_nocheck(new_slot, logical_id, record, record_size);
+                mark_slot_hot(new_slot);
 
                 // Free old slot
                 SizeClassManager &old_scm = SCMs[get_scm_index(old_size)];
@@ -155,7 +158,6 @@ bool StorageEngine::put(const std::string& key, const char* record, uint64_t rec
                 loc.in_use.ram_addr = new_slot;
                 loc.in_use.size = record_size;
                 
-                mark_slot_hot(new_slot);
                 return true;
             }
         }
@@ -167,13 +169,13 @@ bool StorageEngine::put(const std::string& key, const char* record, uint64_t rec
 
             // Set up new header and payload
             init_slot_nocheck(new_slot, logical_id, record, record_size);
+            mark_slot_hot(new_slot);
 
             // Update translation table to bring the record back to RAM
             loc.in_use.is_in_ram = true;
             loc.in_use.ram_addr = new_slot;
             loc.in_use.size = record_size;
             
-            mark_slot_hot(new_slot);
             return true;
         }
     }
@@ -194,7 +196,6 @@ bool StorageEngine::put(const std::string& key, const char* record, uint64_t rec
 
         /* set up the record's header */
         init_slot_nocheck(new_slot_addr, new_logical_id, record, record_size);
-
         mark_slot_hot(new_slot_addr);
 
         return true;
