@@ -14,7 +14,7 @@ Arena::Arena(){
     }
 
     /* init bitmap */
-    for(int i = 0; i<BITMAP_SIZE; i++){ bitmap[i] = 0; }
+    for(size_t i = 0; i<BITMAP_SIZE; i++){ bitmap[i] = 0; }
     last_searched_idx = 0;
 
     high_watermark = TOTAL_PAGES*0.80;
@@ -25,23 +25,29 @@ Arena::Arena(){
 Arena::~Arena(){ munmap(arena_base, ARENA_SIZE); }
 
 void* Arena::alloc_a_page_nocheck(){
-    for(int i = 0; i<BITMAP_SIZE; i++){
+    for(size_t i = 0; i<BITMAP_SIZE; i++){
         size_t idx = (last_searched_idx + i) % BITMAP_SIZE;
 
         /* bitmap[idx] is not full, i.e. not 0xFFFFFFFFFFFFFFFF */
         bitmap_mutex.lock();
         if(bitmap[idx] != ~0ULL){
             unsigned int free_bit = __builtin_ffsll(~bitmap[idx]) - 1;
-
             bitmap[idx] |= (1ULL << free_bit);
+
+            // unlock after setting the bit to minimize the critical section
             bitmap_mutex.unlock();
+
             last_searched_idx = idx;
 
             size_t page_id = 64*idx + free_bit;
             uintptr_t page_base_addr  = reinterpret_cast<uintptr_t>(arena_base) + page_id*PAGE_SIZE;
 
             return reinterpret_cast<void *>(page_base_addr);
-        }else{ bitmap_mutex.unlock(); }
+        }
+        else{
+            // check next one, don't forget to unlock before continue
+            bitmap_mutex.unlock();
+        }
     }
     return nullptr;
 }
@@ -59,11 +65,7 @@ void* Arena::alloc_a_page(){
         std::cerr<<RED<<"OOM: Page alloc failed\n"<<RESET;
         exit(-1);
     }
-
     used_pages.fetch_add(1);
-    // TODO
-    add_to_lru(page);
-
     /* Don't hold any mutex here. 
      * Might suffer a lost wakeup(needs_sweeping is true, but no sweeper awaken),
      * but following alloc_a_page will wake up one eventually.

@@ -54,12 +54,13 @@ struct RecordHeader{
 class StorageEngine{
     private:
         Arena arena;
-        EvictionSweeper sweeper;
+        DiskManager disk_manager;
         /* Recordheader is 8 bytes. Record >= 512B is managed by LargeRecordManager.
          * SCMs ranging from 16 bytes to 256 bytes.
          * 16, 32, 64, 128, 256
          */
         SizeClassManager SCMs[5];
+        EvictionSweeper sweeper;
 
         /* logical id generator, also serves as first_free_idx in translation table */
         uint64_t next_logical_id;
@@ -74,8 +75,16 @@ class StorageEngine{
         std::shared_mutex rw_lock;
         void evict_cold_page();
 
+        /* --------------- helper functions -------------------------- */
+
         /* get the idx of corresponding SCM by size */
         uint8_t get_scm_index(size_t total_size);
+        /* given an allocated slot, initialize it with the given logical id and payload 
+         * don't check whether the size fits, nor whether the slot is allocated.     */
+        void init_slot_nocheck(void* slot_addr, uint64_t logical_id, const char* record, uint64_t record_size);
+
+
+        /* -------- translation table operations -------- */
 
         uint64_t add_to_table(const RecordLoc& new_loc); // on success, return the inserted data's logical id
         void remove_from_table(uint64_t logical_id);
@@ -83,7 +92,7 @@ class StorageEngine{
         void grow_table();
 
     public:
-        StorageEngine();
+        StorageEngine(const std::string& db_file_path, unsigned short table_grow_speed=2);
 
         ~StorageEngine() = default;
 

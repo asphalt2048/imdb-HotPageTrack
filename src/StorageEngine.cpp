@@ -3,9 +3,11 @@
 /*------------------------ctor/dtor-----------------------------*/
 
 namespace imdb{
-StorageEngine::StorageEngine():next_logical_id(0), table_grow_speed(2),
+StorageEngine::StorageEngine(const std::string& db_file_path, unsigned short table_grow_speed):
+    disk_manager(db_file_path),
     SCMs{{16, arena}, {32, arena}, {64, arena}, {128, arena}, {256, arena}},
-    sweeper(arena, [this](){this->evict_cold_page();})
+    sweeper(arena, [this](){this->evict_cold_page();}),
+    next_logical_id(0), table_grow_speed(table_grow_speed)
 {
     translation_table.resize(10000);
     for(int i = 0; i<10000-1; i++){ translation_table[i].next_free_idx = i + 1; }
@@ -22,6 +24,13 @@ uint8_t StorageEngine::get_scm_index(uint64_t total_size) {
     if (total_size <= 256) return 4;
     
     return 255; // Error/Too large
+}
+
+void StorageEngine::init_slot_nocheck(void* slot_addr, uint64_t logical_id, const char* record, uint64_t record_size){
+    RecordHeader* header = reinterpret_cast<RecordHeader*>(slot_addr);
+    header->logical_id = logical_id;
+    char* payload = header->get_payload();
+    std::memcpy(payload, record, record_size);
 }
 
 /*---------------------------------Translationn table related----------------------------------*/
@@ -75,10 +84,11 @@ void StorageEngine::evict_cold_page(){
             // If the translation table agrees that this record lives at this exact memory address:
             if (loc.in_use.is_in_ram && loc.in_use.ram_addr == slot_addr){
                 
-                // TODO: disk IO
-                size_t disk_offset = 0; // Placeholder
+                // write the header AND the payload to disk
+                size_t write_size = sizeof(RecordHeader) + loc.in_use.size;
+                size_t disk_offset = disk_manager.write_record(slot_addr, write_size);
                 
-                // Update the translation table
+                // update the translation table
                 loc.in_use.is_in_ram = false;
                 loc.in_use.disk_offset = disk_offset;
             }
@@ -94,6 +104,12 @@ void StorageEngine::evict_cold_page(){
 /* TODO: for V1.0, global lock is used. */
 
 bool StorageEngine::put(const std::string& key, const char* record, uint64_t record_size){
+    // TODO: remove this line. Currently, without this line, there will be deadlock
+    // cause by put() hold rw_lock and wait on sweeper
+    while(arena.is_critical()){
+        std::this_thread::yield(); // yield to sweeper
+    }
+
     std::unique_lock<std::shared_mutex> write_lock(rw_lock);
     
     size_t real_size = record_size + sizeof(RecordHeader);
@@ -116,13 +132,10 @@ bool StorageEngine::put(const std::string& key, const char* record, uint64_t rec
 
             /* case 1.1.1: New data fits in the existing slot. Update in-place. */
             if( real_size <= old_size){
-                RecordHeader* header = reinterpret_cast<RecordHeader*>(slot_addr);
-                char* payload = header->get_payload();
-                std::memcpy(payload, record, record_size);
+                init_slot_nocheck(slot_addr, logical_id, record, record_size);
 
                 loc.in_use.size = record_size;
                 mark_slot_hot(slot_addr);
-
                 return true;
             }
             /* case 1.1.2: New data outgrows the current slot. Reallocate. */
@@ -131,9 +144,7 @@ bool StorageEngine::put(const std::string& key, const char* record, uint64_t rec
                 void* new_slot = scm.alloc();
 
                 // Set up new header and payload
-                RecordHeader* new_header = reinterpret_cast<RecordHeader*>(new_slot);
-                new_header->logical_id = logical_id;
-                std::memcpy(new_header->get_payload(), record, record_size);
+                init_slot_nocheck(new_slot, logical_id, record, record_size);
 
                 // Free old slot
                 SizeClassManager &old_scm = SCMs[get_scm_index(old_size)];
@@ -150,33 +161,41 @@ bool StorageEngine::put(const std::string& key, const char* record, uint64_t rec
         }
         /* case 1.2: record is in disk */
         else{
-            // TODO: 
-            return false;
+            // allocate a new slot in RAM for the updated record
+            SizeClassManager &scm = SCMs[get_scm_index(real_size)];
+            void* new_slot = scm.alloc();
+
+            // Set up new header and payload
+            init_slot_nocheck(new_slot, logical_id, record, record_size);
+
+            // Update translation table to bring the record back to RAM
+            loc.in_use.is_in_ram = true;
+            loc.in_use.ram_addr = new_slot;
+            loc.in_use.size = record_size;
+            
+            mark_slot_hot(new_slot);
+            return true;
         }
     }
     /* case 2: record doesn't exist insert a new one */
     else{
         /* Don't foeget to take header into account */
         SizeClassManager &scm = SCMs[get_scm_index(record_size+sizeof(RecordHeader))];
-        void* slot_addr = scm.alloc();
+        void* new_slot_addr = scm.alloc();
 
         /* update the translation table */
         RecordLoc new_loc;
         new_loc.in_use.is_in_ram = true;
         new_loc.in_use.size = record_size;
-        new_loc.in_use.ram_addr = slot_addr;
+        new_loc.in_use.ram_addr = new_slot_addr;
 
-        uint64_t logical_id = add_to_table(new_loc);
-        hashmap[key] = logical_id;
+        uint64_t new_logical_id = add_to_table(new_loc);
+        hashmap[key] = new_logical_id;
 
         /* set up the record's header */
-        RecordHeader* header = reinterpret_cast<RecordHeader*>(slot_addr);
-        header->logical_id = logical_id;
-        /* store the record */
-        char* payload = header->get_payload();
-        std::memcpy(payload, record, record_size);
+        init_slot_nocheck(new_slot_addr, new_logical_id, record, record_size);
 
-        mark_slot_hot(slot_addr);
+        mark_slot_hot(new_slot_addr);
 
         return true;
     }
@@ -203,8 +222,14 @@ bool StorageEngine::get(const std::string& key, char* buf, uint64_t& record_size
         return true;
     }
     else{
-        // TODO: data in disk
-        return false;
+        // Data is on disk. 
+        size_t payload_offset = loc.in_use.disk_offset + sizeof(RecordHeader);
+        
+        bool success = disk_manager.read_record(payload_offset, buf, loc.in_use.size);
+        if(!success) return false;
+
+        record_size = loc.in_use.size;
+        return true;
     }
 }
 

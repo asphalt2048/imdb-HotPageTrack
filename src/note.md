@@ -73,3 +73,5 @@ SC<1> and SC<2> is of different type. You can't put them in the same vector or a
 CV requires the mutex to be hold before wait() and signal() is called. Why? To protect that: during the time gap of checking the variable(condition) and calling wait, the condition haven't been changed.
 
 ## std::unique_lock, std::lock_guard
+
+## slotted page used by B+ tree DB
