@@ -48,5 +48,17 @@ class SizeClassManager{
         void* alloc();
         /* free a slot, if page become free, return it to the arena*/
         void free(void* raw_addr);
+
+        /* Called ONLY by the Sweeper when a page is being forcefully evicted to disk.
+         * This is not a confortable solution. As sweeper have to touch a SCM when evicting a page, 
+         * even though it touch it only to call this function.
+         */
+        void reclaim_evicted_page(Page* page) {
+            if (page->header.used > 0 && page->header.used < page->header.max_slots) {
+                remove_from_partial_list(page);
+            }
+            arena.remove_from_lru(reinterpret_cast<void*>(page));
+            arena.free_a_page(reinterpret_cast<void*>(page));
+        }
 };
 }// namespace imdb

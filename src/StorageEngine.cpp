@@ -56,7 +56,37 @@ void StorageEngine::grow_table(){
 
 /*-----------------------------------------Eviction logic----------------------------------------*/
 void StorageEngine::evict_cold_page(){
+    std::unique_lock<std::shared_mutex> write_lock(rw_lock); // TODO: remove this
 
+    // ==================================================================== TODO: lock 1 for phrase 1
+    // Get the coldest page from the Arena
+    Page* victim_page = reinterpret_cast<Page*>(arena.get_lru_tail());
+    if (!victim_page) return;
+    // Scan every slot on the page
+    for (uint16_t i = 0; i < victim_page->header.max_slots; i++) {
+        char* slot_addr = victim_page->get_slot_addr(i);
+        RecordHeader* header = reinterpret_cast<RecordHeader*>(slot_addr);
+        
+        uint64_t logical_id = header->logical_id;
+
+        if (logical_id < translation_table.size()) {
+            RecordLoc& loc = translation_table[logical_id];
+            
+            // If the translation table agrees that this record lives at this exact memory address:
+            if (loc.in_use.is_in_ram && loc.in_use.ram_addr == slot_addr){
+                
+                // TODO: disk IO
+                size_t disk_offset = 0; // Placeholder
+                
+                // Update the translation table
+                loc.in_use.is_in_ram = false;
+                loc.in_use.disk_offset = disk_offset;
+            }
+        }
+    }
+    // ===================================================================== TODO: lock 2 for phrase 2
+    uint8_t scm_idx = get_scm_index(victim_page->header.slot_size);
+    SCMs[scm_idx].reclaim_evicted_page(victim_page);
 }
 
 /*-----------------------------------------Interface---------------------------------------------*/

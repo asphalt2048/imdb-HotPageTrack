@@ -41,7 +41,9 @@ Page* SizeClassManager::get_a_page(){
 }
 
 void SizeClassManager::return_a_page(Page* page){
-    remove_from_partial_list(page);
+    if(page->header.used < page->header.max_slots){
+        remove_from_partial_list(page);
+    }
     arena.remove_from_lru(page);
     arena.free_a_page(reinterpret_cast<void *>(page));
 }

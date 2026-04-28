@@ -7,6 +7,11 @@ Arena::Arena(){
         std::cerr << RED << "mmap failed, arena setup existing\n"<<RESET;
         exit(-1);
     }
+    /* Pin down arena in memory. We don't want OS to swap our page, we do it ourselves */
+    if(mlock(arena_base, ARENA_SIZE) != 0){
+        std::cerr<<RED<<"Failed to mlock arena\n"<<RESET;
+        exit(-1);
+    }
 
     /* init bitmap */
     for(int i = 0; i<BITMAP_SIZE; i++){ bitmap[i] = 0; }
@@ -70,7 +75,6 @@ void* Arena::alloc_a_page(){
     return page;
 }
 
-// TODO: change used_pages
 void Arena::free_a_page(void *raw_page_base){
     uintptr_t arena_base_ = reinterpret_cast<uintptr_t>(arena_base);
     uintptr_t page_base = reinterpret_cast<uintptr_t>(raw_page_base);
@@ -90,6 +94,7 @@ void Arena::free_a_page(void *raw_page_base){
     bitmap_mutex.unlock();
 
     used_pages.fetch_sub(1);
+    remove_from_lru(raw_page_base);
 
     if(idx < last_searched_idx){ last_searched_idx = idx; } 
     return;
