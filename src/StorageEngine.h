@@ -9,6 +9,7 @@
 #include "SizeClass.h"
 #include "DiskManager.h"
 #include "Sweeper.h"
+#include "ShardedHashmap.h"
 
 namespace imdb{
  
@@ -80,9 +81,9 @@ class StorageEngine{
         std::vector<RecordLoc> translation_table;
         
         /* tracks key -> translation_table index mappings */
-        std::unordered_map<std::string, uint64_t> hashmap;
+        ShardedHashMap hashmap;
 
-        std::shared_mutex rw_lock;
+        std::shared_mutex tt_scm_lock;
         void evict_cold_page();
         /* rescue hot record, and write other records to disk.*/
         void page_hot_rescue(Page* victim_page);
@@ -94,6 +95,11 @@ class StorageEngine{
         /* given an allocated slot, initialize it with the given logical id and payload 
          * don't check whether the size fits, nor whether the slot is allocated.     */
         void init_slot_nocheck(void* slot_addr, uint64_t logical_id, const char* record, uint64_t record_size);
+
+        /* Handles updating a record that already exists in the Translation Table */
+        bool update_record(uint64_t logical_id, const char* record, uint64_t record_size);
+        /* Handles allocating and inserting a brand new record */
+        bool insert_record(const std::string& key, const char* record, uint64_t record_size, uint64_t &collided_id);
 
 
         /* -------- translation table operations -------- */

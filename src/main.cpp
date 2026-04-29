@@ -96,6 +96,81 @@ void test_eviction_and_disk(StorageEngine& db, const string& file_path) {
     cout << "--- Sweeper & Disk Tests Passed! ---\n\n";
 }
 
+void test_insert_race() {
+    std::cout << "--- Starting Concurrent Insert Race Test ---\n";
+
+    // 1. Setup the Database
+    DBConfig cfg;
+    cfg.db_file_path = "../data/test_race.aof";
+    StorageEngine db(cfg);
+
+    // 2. The Starting Gun
+    std::atomic<bool> start_gun{false};
+    std::atomic<int> ready_count{0};
+
+    const int NUM_THREADS = 16;
+    std::vector<std::thread> threads;
+
+    // 3. Spawn the Competitors
+    for (int i = 0; i < NUM_THREADS; ++i) {
+        threads.emplace_back([&db, &start_gun, &ready_count, i]() {
+            // Pre-compute the data so we don't waste time during the race
+            std::string key = "race_key";
+            std::string payload = "Data_from_thread_" + std::to_string(i);
+            
+            // Tell the main thread we are spawned and ready
+            ready_count++;
+
+            // THE SPINLOCK: Wait for the gun to fire!
+            while (!start_gun.load(std::memory_order_acquire)) {
+                std::this_thread::yield(); 
+            }
+
+            // THE SPRINT: All 16 threads hit this line at the exact same nanosecond
+            db.put(key, payload.c_str(), payload.size() + 1); // +1 for null terminator
+        });
+    }
+
+    // Wait for all threads to reach the starting line
+    while (ready_count < NUM_THREADS) {
+        std::this_thread::yield();
+    }
+
+    std::cout << "All 16 threads ready. Firing the starting gun in 3... 2... 1...\n";
+    
+    // 4. FIRE!
+    start_gun.store(true, std::memory_order_release);
+
+    // 5. Wait for the dust to settle
+    for (auto& t : threads) {
+        t.join();
+    }
+
+    // ==========================================
+    // THE ASSERTIONS
+    // ==========================================
+    
+    char buffer[256];
+    uint64_t fetched_size = 0;
+    
+    // Assertion 1: The database must not have crashed, and the key MUST exist.
+    bool success = db.get("race_key", buffer, fetched_size);
+    
+    if (success) {
+        std::cout << "[SUCCESS] Data retrieved without crashing!\n";
+        std::cout << "Winning Thread Data: " << buffer << "\n";
+    } else {
+        std::cout << "[FATAL] The key vanished into the void.\n";
+    }
+
+    // Assertion 2 (Mental Check): 
+    // If you put a print statement inside your rollback `if (!success)` block 
+    // in `insert_new_record`, you should see exactly 15 "Rollback!" prints 
+    // in your console, and exactly 1 thread quietly succeeding.
+    
+    std::cout << "--- Test Complete ---\n\n";
+}
+
 int main(int argc, char* argv[]) {
     // Determine file path. Default to ../data/imdb.aof, but allow terminal override
     string db_path = "../data/imdb.aof";
@@ -123,8 +198,10 @@ int main(int argc, char* argv[]) {
     // 1. Sanity Check
     test_basic_operations(db);
 
-    // 2. The Final Test: Hardware I/O & Background Threading
+    // 2. Hardware I/O & Background Threading
     test_eviction_and_disk(db, db_path);
+
+    test_insert_race();
 
     cout << "=========================================\n";
     cout << " ALL SYSTEMS NOMINAL. ENGINE ONLINE.\n";
