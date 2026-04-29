@@ -75,3 +75,5 @@ CV requires the mutex to be hold before wait() and signal() is called. Why? To p
 ## std::unique_lock, std::lock_guard
 
 ## slotted page used by B+ tree DB
+
+## std::memory_order_

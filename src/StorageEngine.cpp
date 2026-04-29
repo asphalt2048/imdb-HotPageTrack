@@ -3,11 +3,12 @@
 /*------------------------ctor/dtor-----------------------------*/
 
 namespace imdb{
-StorageEngine::StorageEngine(const std::string& db_file_path, unsigned short table_grow_speed):
-    disk_manager(db_file_path),
+StorageEngine::StorageEngine(const DBConfig &cfg):
+    config(cfg),
+    disk_manager(config.db_file_path),
     SCMs{{16, arena}, {32, arena}, {64, arena}, {128, arena}, {256, arena}},
     sweeper(arena, [this](){this->evict_cold_page();}),
-    next_logical_id(0), table_grow_speed(table_grow_speed)
+    next_logical_id(0)
 {
     translation_table.resize(10000);
     for(int i = 0; i<10000-1; i++){ translation_table[i].next_free_idx = i + 1; }
@@ -52,7 +53,7 @@ void StorageEngine::remove_from_table(uint64_t logical_id){
 
 void StorageEngine::grow_table(){
     uint64_t old_size = translation_table.size();
-    uint64_t new_size = old_size*table_grow_speed;
+    uint64_t new_size = old_size*config.table_grow_speed;
     translation_table.resize(new_size);
 
     for(uint64_t i=old_size; i<new_size-1; i++){ 
@@ -79,7 +80,7 @@ void StorageEngine::page_hot_rescue(Page* victim_page){
             if (loc.in_use.is_in_ram && loc.in_use.ram_addr == slot_addr) {
                 
                 // --- BEST EFFORT RESCUE ---
-                if (is_slot_hot(slot_addr)) {
+                if (config.enable_hot_rescue && is_slot_hot(slot_addr)) {
                     size_t total_size = loc.in_use.size + sizeof(RecordHeader);
                     
                     /* TRY to ask free space in SCM. Might fail. 

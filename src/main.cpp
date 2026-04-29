@@ -102,6 +102,8 @@ int main(int argc, char* argv[]) {
     if (argc > 1) {
         db_path = argv[1];
     }
+    DBConfig config;
+    config.db_file_path = db_path;
 
     cout << "=========================================\n";
     cout << " Booting IMDB Kernel-Bypassed Engine...\n";
@@ -116,7 +118,7 @@ int main(int argc, char* argv[]) {
     }
 
     // Boot the DB and inject the path
-    StorageEngine db(db_path);
+    StorageEngine db(config);
 
     // 1. Sanity Check
     test_basic_operations(db);

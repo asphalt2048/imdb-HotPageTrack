@@ -51,10 +51,20 @@ struct RecordHeader{
 };
 #pragma pack(pop)
 
-/* Provides put, get and delete.
+/* config object*/
+struct DBConfig{
+    std::string db_file_path = "../data/imdb.aof";
+    uint8_t table_grow_speed = 2;
+
+    bool enable_hot_rescue = 1;
+};
+
+/* StorageEngine, the highest level interface, provides put, get and delete. 
+ * TODO: it owns sweeper thread. Might wish to move it else where.
  */
 class StorageEngine{
     private:
+        DBConfig config;
         Arena arena;
         DiskManager disk_manager;
         /* Recordheader is 8 bytes. Record >= 512B is managed by LargeRecordManager.
@@ -68,8 +78,6 @@ class StorageEngine{
         uint64_t next_logical_id;
         /* translation table, bridge hashmap and record location. See comment at struct RecordLoc */
         std::vector<RecordLoc> translation_table;
-        /* How much the table grow when it bocomes full: new_size = old_size*table_grow_speed. default 2. */
-        uint8_t table_grow_speed;
         
         /* tracks key -> translation_table index mappings */
         std::unordered_map<std::string, uint64_t> hashmap;
@@ -92,11 +100,11 @@ class StorageEngine{
 
         uint64_t add_to_table(const RecordLoc& new_loc); // on success, return the inserted data's logical id
         void remove_from_table(uint64_t logical_id);
-        /* grow the table by factor table_grow_speed */
+        /* grow the table by factor config.table_grow_speed */
         void grow_table();
 
     public:
-        StorageEngine(const std::string& db_file_path, unsigned short table_grow_speed=2);
+        StorageEngine(const DBConfig &cfg = DBConfig());
 
         ~StorageEngine() = default;
 
