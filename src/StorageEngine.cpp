@@ -64,41 +64,80 @@ void StorageEngine::grow_table(){
 }
 
 /*-----------------------------------------Eviction logic----------------------------------------*/
-void StorageEngine::evict_cold_page(){
-    std::unique_lock<std::shared_mutex> write_lock(rw_lock); // TODO: remove this
+void StorageEngine::page_hot_rescue(Page* victim_page){
+    uint16_t max_slots = victim_page->header.max_slots;
+    SizeClassManager &scm = SCMs[get_scm_index(victim_page->header.slot_size)];
 
-    // ==================================================================== TODO: lock 1 for phrase 1
-    // Get the coldest page from the Arena
-    Page* victim_page = reinterpret_cast<Page*>(arena.get_lru_tail());
-    if (!victim_page) return;
-
-    // TODO: implement hot rescue
-    // Scan every slot on the page
-    for (uint16_t i = 0; i < victim_page->header.max_slots; i++) {
+    for (uint16_t i = 0; i < max_slots; i++) {
         char* slot_addr = victim_page->get_slot_addr(i);
         RecordHeader* header = reinterpret_cast<RecordHeader*>(slot_addr);
-        
         uint64_t logical_id = header->logical_id;
 
         if (logical_id < translation_table.size()) {
             RecordLoc& loc = translation_table[logical_id];
             
-            // If the translation table agrees that this record lives at this exact memory address:
-            if (loc.in_use.is_in_ram && loc.in_use.ram_addr == slot_addr){
+            if (loc.in_use.is_in_ram && loc.in_use.ram_addr == slot_addr) {
                 
-                // write the header AND the payload to disk
-                size_t write_size = sizeof(RecordHeader) + loc.in_use.size;
-                size_t disk_offset = disk_manager.write_record(slot_addr, write_size);
+                // --- BEST EFFORT RESCUE ---
+                if (is_slot_hot(slot_addr)) {
+                    size_t total_size = loc.in_use.size + sizeof(RecordHeader);
+                    
+                    /* TRY to ask free space in SCM. Might fail. 
+                     * If fail, let the record die(write to disk).
+                     *
+                     * WARNING: allocation in this section must not sleep!
+                     */
+                    void* new_slot = scm.alloc_notrigger();
+                    
+                    if (new_slot != nullptr) {
+                        std::memcpy(new_slot, slot_addr, total_size);
+                        loc.in_use.ram_addr = new_slot;
+                        mark_slot_cold(new_slot); 
+                        continue;
+                    }
+                    // TODO: do we lift the 'new home' in lru?
+                }
+
+                // --- COLD EVICTION (OR RESCUE FAILED) ---
+                size_t total_size = loc.in_use.size + sizeof(RecordHeader);
+                size_t disk_offset = disk_manager.write_record(slot_addr, total_size);
                 
-                // update the translation table
                 loc.in_use.is_in_ram = false;
                 loc.in_use.disk_offset = disk_offset;
             }
         }
     }
-    // ===================================================================== TODO: lock 2 for phrase 2
-    uint8_t scm_idx = get_scm_index(victim_page->header.slot_size);
-    SCMs[scm_idx].reclaim_evicted_page(victim_page); // TODO: can we make this lock-free?
+}
+void StorageEngine::evict_cold_page() {
+    std::unique_lock<std::shared_mutex> write_lock(rw_lock);
+
+    while (true) {
+        Page* victim_page = reinterpret_cast<Page*>(arena.get_lru_tail());
+        if (!victim_page) return; 
+
+        uint16_t max_slots = victim_page->header.max_slots;
+        
+
+        /* =======================================================================
+         * Clock algorithm
+         * If a page have (hot records > max_slot/PAGE_HOT_SCALE), give it a second chance.
+         * the page is lifted to the head of lru. And all hot bits are cleared
+          ======================================================================= */
+        uint16_t hot_count = get_page_hot_count(victim_page);
+        if (hot_count > (max_slots / PAGE_HOT_SCALE)) {
+            clear_page_hot_bits(victim_page);
+            arena.lift_in_lru(victim_page);
+            continue; 
+        }
+        
+        /* page selected as evcition target */
+        page_hot_rescue(victim_page);
+
+        /* reclaim the page. */
+        uint8_t scm_idx = get_scm_index(victim_page->header.slot_size);
+        SCMs[scm_idx].reclaim_evicted_page(victim_page);
+        break; 
+    }
 }
 
 /*-----------------------------------------Interface---------------------------------------------*/
@@ -253,7 +292,8 @@ bool StorageEngine::del(const std::string& key){
     } 
     /* record is in disk, logical delete */
     else{
-        // TODO: Logical deletion for on-disk records (tombstoning)
+        // Logical deletion for on-disk records. We just delete metadata.
+        // that way from the user's view, the record is deleted as well.
     }
 
     remove_from_table(logical_id);

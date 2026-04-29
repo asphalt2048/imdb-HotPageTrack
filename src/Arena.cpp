@@ -169,34 +169,52 @@ void* Arena::get_lru_tail(){
 // (this is a write to page, a write need a lock)
 // false positive acceptive?
 void mark_slot_hot(void* slot_addr){
-    uintptr_t slot_addr_ = reinterpret_cast<uintptr_t>(slot_addr);
-    uintptr_t page_base = PAGE_ALIGN(slot_addr_);
-
-    Page* page = reinterpret_cast<Page*>(page_base);
-
-    uint16_t slot_id = ((slot_addr_-page_base) - page->header.header_reserved) / page->header.slot_size;
+    Page* page = get_struct_page(slot_addr);
+    uint16_t slot_id = page->get_slot_id_nocheck(slot_addr);
 
     size_t arr_idx = slot_id / 64;
     size_t bit_idx = slot_id % 64;
 
-    page->is_hot[arr_idx] |= (1ULL << bit_idx);
+    page->is_hot[arr_idx].fetch_or(1ULL << bit_idx, std::memory_order_relaxed);
 };
 
 // TODO: lock free or not? Does user need to hold lock when calling this function?
 // (this is a write to page, a write need a lock)
 void mark_slot_cold(void* slot_addr){
-    uintptr_t slot_addr_ = reinterpret_cast<uintptr_t>(slot_addr);
-    uintptr_t page_base = PAGE_ALIGN(slot_addr_);
-
-    Page* page = reinterpret_cast<Page*>(page_base);
-
-    uint16_t slot_id = ((slot_addr_-page_base) - page->header.header_reserved) / page->header.slot_size;
+    Page* page = get_struct_page(slot_addr);
+    uint16_t slot_id = page->get_slot_id_nocheck(slot_addr);
 
     size_t arr_idx = slot_id / 64;
     size_t bit_idx = slot_id % 64;
 
-    page->is_hot[arr_idx] &= ~(1ULL << bit_idx);
+    page->is_hot[arr_idx].fetch_and(~(1ULL << bit_idx), std::memory_order_relaxed);
 };
+
+bool is_slot_hot(void* slot_addr){
+    Page* page = get_struct_page(slot_addr);
+    uint16_t slot_id = page->get_slot_id_nocheck(slot_addr);
+
+    size_t arr_idx = slot_id / 64;
+    size_t bit_idx = slot_id % 64;
+
+    return page->is_hot[arr_idx].load(std::memory_order_relaxed) & (1ULL << bit_idx);
+}
+
+uint16_t get_page_hot_count(Page* page) {
+    uint16_t total_hot = 0;
+    for (int i = 0; i < IS_HOT_ARR_LENGTH; i++) {
+        // no lock. 'slightly false' value is acceptable
+        uint64_t chunk = page->is_hot[i].load(std::memory_order_relaxed);
+        total_hot += __builtin_popcountll(chunk);
+    }
+    return total_hot;
+}
+
+void clear_page_hot_bits(Page* page) {
+    for (int i = 0; i < 4; i++) {
+        page->is_hot[i].store(0ULL, std::memory_order_relaxed);
+    }
+}
 
 Page* get_struct_page(void* slot_addr){
     uintptr_t slot_addr_ = reinterpret_cast<uintptr_t>(slot_addr);

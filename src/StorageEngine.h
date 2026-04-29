@@ -11,6 +11,8 @@
 #include "Sweeper.h"
 
 namespace imdb{
+ 
+#define PAGE_HOT_SCALE 4  
 #define TABLE_END  0XFFFFFFFFFFFFFFFF
 /* strcut RecordLoc(record location). Content in the translation table. 
  *
@@ -74,6 +76,8 @@ class StorageEngine{
 
         std::shared_mutex rw_lock;
         void evict_cold_page();
+        /* rescue hot record, and write other records to disk.*/
+        void page_hot_rescue(Page* victim_page);
 
         /* --------------- helper functions -------------------------- */
 
@@ -104,4 +108,4 @@ class StorageEngine{
         bool del(const std::string& key);
 };
 
-}// namespace imdb
+} // namespace imdb

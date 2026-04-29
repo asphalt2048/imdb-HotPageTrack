@@ -44,8 +44,12 @@ class SizeClassManager{
         SizeClassManager(uint16_t slot_size, Arena& arena): slot_size(slot_size), arena(arena) {partial_list_head = nullptr;}
         ~SizeClassManager() = default;
         
-        /* alloate a slot, if page becomes full, stop tracking the page */
+        /* alloate a slot, if page becomes full, stop tracking the page
+         * will ask arena for new page if needed, might sleep. Not supposed to fail
+         */
         void* alloc();
+        /* allocate a slot if SCM have free space, never ask new page. Might fail */
+        void* alloc_notrigger();
         /* free a slot, if page become free, return it to the arena*/
         void free(void* raw_addr);
 

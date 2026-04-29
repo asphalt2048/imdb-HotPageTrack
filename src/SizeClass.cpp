@@ -1,5 +1,8 @@
 #include "SizeClass.h"
 
+// operations is current protected by and only by db-global lock. 
+// ======================================================================================
+
 namespace imdb{
 void SizeClassManager::push_to_partial_list(Page *page){
     page->header.prev = nullptr;
@@ -33,7 +36,6 @@ Page* SizeClassManager::get_a_page(){
 
     Page* page = init_page(raw_addr);
     // TODO: adding and removing here? Or elsewhere?
-    // should partial pages be in lru?
     arena.add_to_lru(page);
     push_to_partial_list(page);
 
@@ -68,7 +70,7 @@ Page* SizeClassManager::init_page(void* raw_page_base){
 
     /* setup is_hot array */
     for(int i=0; i < 4; i++){
-        page->is_hot[i] = 0ULL;
+        page->is_hot[i].store(0ULL, std::memory_order_relaxed);
     }
 
     /* setup slots' internal free list */
@@ -88,6 +90,23 @@ void* SizeClassManager::alloc(){
     if(!page){
         page = get_a_page();
     }
+
+    uint16_t slot_idx = page->header.first_free_idx;
+    page->header.first_free_idx = page->next_free(slot_idx);
+    page->header.used++;
+
+    if(page->header.used == page->header.max_slots){
+        remove_from_partial_list(page);
+    }
+
+    return static_cast<void*>(page->get_slot_addr(slot_idx));
+}
+
+/* allocate a slot if SCM have free space, never ask new page. Might fail */
+void* SizeClassManager::alloc_notrigger(){
+    Page* page = partial_list_head;
+
+    if(!page) return nullptr;
 
     uint16_t slot_idx = page->header.first_free_idx;
     page->header.first_free_idx = page->next_free(slot_idx);
