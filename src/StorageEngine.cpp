@@ -2,6 +2,10 @@
 
 /*------------------------ctor/dtor-----------------------------*/
 
+/* TODO: DB now boots with translation table in a static size. */
+
+#define TABLE_SIZE 1000000
+
 namespace imdb{
 StorageEngine::StorageEngine(const DBConfig &cfg):
     config(cfg),
@@ -10,10 +14,51 @@ StorageEngine::StorageEngine(const DBConfig &cfg):
     sweeper(arena, [this](){this->evict_cold_page();}),
     next_logical_id(0)
 {
-    translation_table.resize(10000);
-    for(int i = 0; i<10000-1; i++){ translation_table[i].next_free_idx = i + 1; }
-    translation_table[9999].next_free_idx = TABLE_END;
+    translation_table.resize(TABLE_SIZE);
+    for(int i = 0; i<TABLE_SIZE-1; i++){ translation_table[i].next_free_idx = i + 1; }
+    translation_table[TABLE_SIZE-1].next_free_idx = TABLE_END;
 }
+
+/*---------------------------------Translationn table related----------------------------------*/
+
+uint64_t StorageEngine::add_to_table(RecordLoc& new_loc){
+    std::unique_lock<std::shared_mutex> write_lock(tt_meta_rw_lock);
+
+    if(next_logical_id == TABLE_END){
+        std::cerr<<RED<<"Fatal: TT exhausted\n"<<RESET;
+        exit(-1);
+    }
+
+    uint64_t logical_id = next_logical_id;
+    next_logical_id = translation_table[next_logical_id].next_free_idx;
+    translation_table[logical_id] = new_loc;
+
+    return logical_id;
+}
+
+void StorageEngine::remove_from_table(uint64_t logical_id){
+    std::unique_lock<std::shared_mutex> write_lock(tt_meta_rw_lock);
+
+    translation_table[logical_id].next_free_idx = next_logical_id;
+    next_logical_id = logical_id;
+}
+
+// TODO: .resize() is actually copy&paste, which means
+// a concurrent access to TT might read on the old location
+/*
+void StorageEngine::grow_table(){
+    uint64_t old_size = translation_table.size();
+    uint64_t new_size = old_size*config.table_grow_speed;
+    translation_table.resize(new_size);
+
+    for(uint64_t i=old_size; i<new_size-1; i++){ 
+        translation_table[i].next_free_idx = i+1;
+    }
+    translation_table[new_size-1].next_free_idx = TABLE_END;
+
+    next_logical_id = old_size;
+}
+*/
 
 /*------------------------------------Helper Functions---------------------------------------*/
 
@@ -29,18 +74,30 @@ uint8_t StorageEngine::get_scm_index(uint64_t total_size) {
 
 /* given an allocated slot, initialize it with the given logical id and payload 
  * don't check whether the size fits, nor whether the slot is allocated.     */
-void StorageEngine::init_slot_nocheck(void* slot_addr, uint64_t logical_id, const char* record, uint64_t record_size){
+void StorageEngine::fill_slot_nocheck(void* slot_addr, uint64_t logical_id, const char* record, uint64_t record_size){
     RecordHeader* header = reinterpret_cast<RecordHeader*>(slot_addr);
     header->logical_id = logical_id;
     char* payload = header->get_payload();
     std::memcpy(payload, record, record_size);
 }
 
-bool StorageEngine::update_record(uint64_t logical_id, const char* record, uint64_t record_size) {
+bool StorageEngine::hashmap_recheck(const std::string &key, uint64_t expected_id){
+    uint64_t check_id;
+    if(!hashmap.get(key, check_id) || check_id != expected_id){
+        return false;
+    }
+    return true;
+}
+
+bool StorageEngine::update_record(const std::string &key, uint64_t logical_id, const char* record, uint64_t record_size) {
     size_t real_size = record_size + sizeof(RecordHeader);
-    // TODO: We still hold the global lock here for now. 
-    // In the next step, we will move this down to enable Optimistic Concurrency!
-    std::unique_lock<std::shared_mutex> write_lock(tt_scm_lock);
+
+    size_t lock_idx = logical_id % TT_SHARDS;
+    std::unique_lock<std::shared_mutex> write_lock(tt_locks[lock_idx]);
+
+    if(!hashmap_recheck(key, logical_id)){
+        return false;
+    }
 
     RecordLoc& loc = translation_table[logical_id];
 
@@ -51,7 +108,7 @@ bool StorageEngine::update_record(uint64_t logical_id, const char* record, uint6
 
         /* case 1.1: New data fits in the existing slot. Update in-place. */
         if( real_size <= old_size){
-            init_slot_nocheck(slot_addr, logical_id, record, record_size);
+            fill_slot_nocheck(slot_addr, logical_id, record, record_size);
             mark_slot_hot(slot_addr);
             loc.in_use.size = record_size;
             return true;
@@ -61,7 +118,7 @@ bool StorageEngine::update_record(uint64_t logical_id, const char* record, uint6
             SizeClassManager &scm = SCMs[get_scm_index(real_size)];
             void* new_slot = scm.alloc();
 
-            init_slot_nocheck(new_slot, logical_id, record, record_size);
+            fill_slot_nocheck(new_slot, logical_id, record, record_size);
             mark_slot_hot(new_slot);
 
             SizeClassManager &old_scm = SCMs[get_scm_index(old_size)];
@@ -78,7 +135,7 @@ bool StorageEngine::update_record(uint64_t logical_id, const char* record, uint6
         SizeClassManager &scm = SCMs[get_scm_index(real_size)];
         void* new_slot = scm.alloc();
 
-        init_slot_nocheck(new_slot, logical_id, record, record_size);
+        fill_slot_nocheck(new_slot, logical_id, record, record_size);
         mark_slot_hot(new_slot);
 
         loc.in_use.is_in_ram = true;
@@ -89,10 +146,6 @@ bool StorageEngine::update_record(uint64_t logical_id, const char* record, uint6
 }
 
 bool StorageEngine::insert_record(const std::string& key, const char* record, uint64_t record_size, uint64_t &collided_id) {
-    // TODO: We still hold the global lock here for now. 
-    // In the next step, we will move this down to enable Optimistic Concurrency!
-    std::unique_lock<std::shared_mutex> write_lock(tt_scm_lock);
-
     SizeClassManager &scm = SCMs[get_scm_index(record_size + sizeof(RecordHeader))];
     void* new_slot_addr = scm.alloc();
 
@@ -113,49 +166,17 @@ bool StorageEngine::insert_record(const std::string& key, const char* record, ui
         return false;
     }
 
-    init_slot_nocheck(new_slot_addr, new_logical_id, record, record_size);
+    fill_slot_nocheck(new_slot_addr, new_logical_id, record, record_size);
     mark_slot_hot(new_slot_addr);
 
     return true;
 }
 
-/*---------------------------------Translationn table related----------------------------------*/
-
-uint64_t StorageEngine::add_to_table(const RecordLoc& new_loc){
-    if(next_logical_id == TABLE_END) grow_table();
-
-    uint64_t logical_id = next_logical_id;
-    next_logical_id = translation_table[next_logical_id].next_free_idx;
-    translation_table[logical_id] = new_loc;
-
-    return logical_id;
-}
-
-void StorageEngine::remove_from_table(uint64_t logical_id){
-    translation_table[logical_id].next_free_idx = next_logical_id;
-    next_logical_id = logical_id;
-}
-
-void StorageEngine::grow_table(){
-    uint64_t old_size = translation_table.size();
-    uint64_t new_size = old_size*config.table_grow_speed;
-    translation_table.resize(new_size);
-
-    for(uint64_t i=old_size; i<new_size-1; i++){ 
-        translation_table[i].next_free_idx = i+1;
-    }
-    translation_table[new_size-1].next_free_idx = TABLE_END;
-
-    next_logical_id = old_size;
-}
-
 /*-----------------------------------------Interface---------------------------------------------*/
 
-/* TODO: for V1.0, global lock is used. */
-
 bool StorageEngine::put(const std::string& key, const char* record, uint64_t record_size){
-    // TODO: remove this line. Currently, without this line, there will be deadlock
-    // cause by put() hold rw_lock and wait on sweeper
+    // Direct relcaim
+    // TODO: I really want to remove this line. 
     while(arena.is_critical()){
         std::this_thread::yield(); // yield to sweeper
     }
@@ -167,17 +188,30 @@ bool StorageEngine::put(const std::string& key, const char* record, uint64_t rec
     }
 
     uint64_t logical_id;
-    bool exist = hashmap.get(key, logical_id);
+    
 
-    if (exist) {
-        return update_record(logical_id, record, record_size);
-    } else {
-        uint64_t collided_id;
-        bool succ = insert_record(key, record, record_size, collided_id);
-        if(!succ){
-            return update_record(collided_id, record, record_size);
+    /* the UPSERT semantic requires a put to be executed no matter what */
+    while(true){
+        bool exist = hashmap.get(key, logical_id);
+
+        if (exist){
+            // it's an update
+            /* beware of TOCTOU: if a del got ahead, an update will become an insert 
+             * update should double check whether the record exists. 
+             */
+            if(update_record(key, logical_id, record, record_size)){
+                return true;
+            }
+        } else {
+            // it's an insert
+            /* beware of insert race: if two inserts with same key fires simultaneously,
+             * the loser of the race should become an update.
+             */
+            uint64_t collided_id;
+            if(insert_record(key, record, record_size, collided_id)){
+                return true;
+            }
         }
-        return true;
     }
 }
 
@@ -186,7 +220,13 @@ bool StorageEngine::get(const std::string& key, char* buf, uint64_t& record_size
     bool exist = hashmap.get(key, logical_id);
     if(!exist) {std::cerr<<RED<<"Get record with key: "<<key<<" error: record not exists\n"<<RESET; return false;}
 
-    std::shared_lock<std::shared_mutex> read_lock(tt_scm_lock);
+    size_t lock_idx = logical_id % TT_SHARDS;
+    std::shared_lock<std::shared_mutex> read_lock(tt_locks[lock_idx]);
+
+    if(!hashmap_recheck(key, logical_id)){
+        // the mapping has been changed, means the old record has been deleted
+        return false;
+    }
 
     RecordLoc& loc = translation_table[logical_id];
 
@@ -205,6 +245,7 @@ bool StorageEngine::get(const std::string& key, char* buf, uint64_t& record_size
         // Data is on disk. 
         size_t payload_offset = loc.in_use.disk_offset + sizeof(RecordHeader);
         
+        // TODO: swap data in
         bool success = disk_manager.read_record(payload_offset, buf, loc.in_use.size);
         if(!success) return false;
 
@@ -218,7 +259,13 @@ bool StorageEngine::del(const std::string& key){
     bool exist = hashmap.get(key, logical_id);
     if(!exist) {std::cerr<<RED<<"Delete record with key: "<<key<<" error: record not exists\n"<<RESET; return false;}
 
-    std::unique_lock<std::shared_mutex> write_lock(tt_scm_lock);
+    size_t lock_idx = logical_id % TT_SHARDS;
+    std::unique_lock<std::shared_mutex> write_lock(tt_locks[lock_idx]);
+
+    if(!hashmap_recheck(key, logical_id)){
+        // the mapping in hashmap has been changed, means a concurrent delete got ahead
+        return false;
+    }
 
     RecordLoc &loc = translation_table[logical_id];
 
@@ -246,20 +293,58 @@ bool StorageEngine::del(const std::string& key){
 /*-----------------------------------------Eviction logic----------------------------------------*/
 /* ============================================================================================= */
 
-void StorageEngine::page_hot_rescue(Page* victim_page){
+void StorageEngine::page_hot_rescue(Page* victim_page, bool &page_fully_cleared){
     uint16_t max_slots = victim_page->header.max_slots;
     SizeClassManager &scm = SCMs[get_scm_index(victim_page->header.slot_size)];
+    // flag, determine how aggresive sweeper acts
+    bool is_critical = arena.is_critical();
+    page_fully_cleared = true;
+
+    /* TODO: there is a TOCTOU bug, that the victim page become empty and 
+     * returned to arena. Since arena uses a bitmap, so refree a page won't
+     * cause a double-free problem. We just waste a few CPU iterating through an
+     * empty page
+     */
+
+    // isolate the page so that no insert will use this page
+    scm.quarantine_page(victim_page);
 
     for (uint16_t i = 0; i < max_slots; i++) {
+        /* TODO: free slot bug: don't know whether the slot is in use or not.
+         * we would want to skip empty slot. But there is no way to know that
+         */
+
         char* slot_addr = victim_page->get_slot_addr(i);
         RecordHeader* header = reinterpret_cast<RecordHeader*>(slot_addr);
         uint64_t logical_id = header->logical_id;
 
+        // must do this check.
         if (logical_id < translation_table.size()) {
+
+            size_t lock_idx = logical_id % TT_SHARDS;
+            std::unique_lock<std::shared_mutex> write_lock(tt_locks[lock_idx], std::try_to_lock);
+
+            /* (1)is_critical: sweeper will wait to grab every lock, making sure 
+             * a full page is evcited.
+             * (2)!is_critical: sweeper will let this slot go, ends up freeing only a part
+             * of a page
+             */
+            if(!write_lock.owns_lock()){
+                if(!is_critical){
+                    page_fully_cleared = false;
+                    continue;
+                }else{
+                    write_lock.lock();
+                }
+            }
+
             RecordLoc& loc = translation_table[logical_id];
             
-            if (loc.in_use.is_in_ram && loc.in_use.ram_addr == slot_addr) {
-                
+            /* A unprincipled solution to the "free slot bug" mentioned above.
+             * If a slot is free, where is in ram_addr will become next_free_idx,
+             * there is only a tiny chance that those are equal.
+             */
+            if (loc.in_use.is_in_ram && loc.in_use.ram_addr == slot_addr){
                 // --- BEST EFFORT RESCUE ---
                 if (config.enable_hot_rescue && is_slot_hot(slot_addr)) {
                     size_t total_size = loc.in_use.size + sizeof(RecordHeader);
@@ -289,10 +374,11 @@ void StorageEngine::page_hot_rescue(Page* victim_page){
             }
         }
     }
+    if(!page_fully_cleared){
+        scm.unquarantine_page(victim_page);
+    }
 }
 void StorageEngine::evict_cold_page() {
-    std::unique_lock<std::shared_mutex> write_lock(tt_scm_lock);
-
     while (true) {
         Page* victim_page = reinterpret_cast<Page*>(arena.get_lru_tail());
         if (!victim_page) return; 
@@ -313,12 +399,18 @@ void StorageEngine::evict_cold_page() {
         }
         
         /* page selected as evcition target */
-        page_hot_rescue(victim_page);
+        bool page_fully_cleared;
+        page_hot_rescue(victim_page, page_fully_cleared);
 
-        /* reclaim the page. */
-        uint8_t scm_idx = get_scm_index(victim_page->header.slot_size);
-        SCMs[scm_idx].reclaim_evicted_page(victim_page);
-        break; 
+        /* reclaim the page if fully cleared */
+        if(page_fully_cleared){
+            uint8_t scm_idx = get_scm_index(victim_page->header.slot_size);
+            SCMs[scm_idx].reclaim_evicted_page(victim_page);
+        }
+
+        if(arena.is_safe()){
+            break;
+        }
     }
 }
 

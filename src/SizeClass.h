@@ -12,6 +12,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <shared_mutex>
 #include "Arena.h"
 
 #define SLOT_END 0XFFFF
@@ -31,6 +32,8 @@ class SizeClassManager{
 
         Arena& arena;
 
+        std::shared_mutex rw_lock;
+
         void push_to_partial_list(Page *page);
         void remove_from_partial_list(Page *page);
 
@@ -48,10 +51,14 @@ class SizeClassManager{
          * will ask arena for new page if needed, might sleep. Not supposed to fail
          */
         void* alloc();
-        /* allocate a slot if SCM have free space, never ask new page. Might fail */
-        void* alloc_notrigger();
         /* free a slot, if page become free, return it to the arena*/
         void free(void* raw_addr);
+        /* allocate a slot if SCM have free space, never ask new page. Might fail */
+        void* alloc_notrigger();
+        /* same as remove_from_partial_list, used by sweeper thread to isolate page */
+        void quarantine_page(Page* page);
+        /* same as push_to_partial_list, used by sweeper to return a not fully cleared page */
+        void unquarantine_page(Page* page);
 
         /* Called ONLY by the Sweeper when a page is being forcefully evicted to disk.
          * This is not a confortable solution. As sweeper have to touch a SCM when evicting a page, 

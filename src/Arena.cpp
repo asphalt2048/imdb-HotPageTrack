@@ -97,7 +97,7 @@ void Arena::free_a_page(void *raw_page_base){
     bitmap_mutex.unlock();
 
     used_pages.fetch_sub(1);
-    remove_from_lru(raw_page_base);
+    // remove_from_lru(raw_page_base);
 
     if(idx < last_searched_idx){ last_searched_idx = idx; } 
     return;
@@ -115,15 +115,15 @@ void Arena::add_to_lru(void* page_base){
     Page* page = reinterpret_cast<Page*>(page_base);
     std::lock_guard<std::mutex> lock(lru_mutex);
 
-    if (page->header.lru_pointers.lru_next != nullptr || 
-        page->header.lru_pointers.lru_prev != nullptr || lru_head == page) {
+    if (page->header.lru_next != nullptr || 
+        page->header.lru_prev != nullptr || lru_head == page) {
         return; // Already in list
     }
 
-    page->header.lru_pointers.lru_next = lru_head;
-    page->header.lru_pointers.lru_prev = nullptr;
+    page->header.lru_next = lru_head;
+    page->header.lru_prev = nullptr;
 
-    if (lru_head) lru_head->header.lru_pointers.lru_prev = page;
+    if (lru_head) lru_head->header.lru_prev = page;
     lru_head = page;
 
     if (!lru_tail) lru_tail = page;
@@ -133,20 +133,20 @@ void Arena::remove_from_lru(void* page_base){
     Page* page = reinterpret_cast<Page*>(page_base);
     std::lock_guard<std::mutex> lock(lru_mutex);
 
-    if (page->header.lru_pointers.lru_prev) {
-        page->header.lru_pointers.lru_prev->header.lru_pointers.lru_next = page->header.lru_pointers.lru_next;
+    if (page->header.lru_prev) {
+        page->header.lru_prev->header.lru_next = page->header.lru_next;
     } else {
-        lru_head = page->header.lru_pointers.lru_next;
+        lru_head = page->header.lru_next;
     }
 
-    if (page->header.lru_pointers.lru_next) {
-        page->header.lru_pointers.lru_next->header.lru_pointers.lru_prev = page->header.lru_pointers.lru_prev;
+    if (page->header.lru_next) {
+        page->header.lru_next->header.lru_prev = page->header.lru_prev;
     } else {
-        lru_tail = page->header.lru_pointers.lru_prev;
+        lru_tail = page->header.lru_prev;
     }
 
-    page->header.lru_pointers.lru_next = nullptr;
-    page->header.lru_pointers.lru_prev = nullptr;
+    page->header.lru_next = nullptr;
+    page->header.lru_prev = nullptr;
 }
 
 void Arena::lift_in_lru(void* page_base){

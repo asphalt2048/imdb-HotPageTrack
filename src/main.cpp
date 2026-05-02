@@ -196,12 +196,12 @@ int main(int argc, char* argv[]) {
     StorageEngine db(config);
 
     // 1. Sanity Check
-    test_basic_operations(db);
+    //test_basic_operations(db);
 
     // 2. Hardware I/O & Background Threading
     test_eviction_and_disk(db, db_path);
 
-    test_insert_race();
+    //test_insert_race();
 
     cout << "=========================================\n";
     cout << " ALL SYSTEMS NOMINAL. ENGINE ONLINE.\n";

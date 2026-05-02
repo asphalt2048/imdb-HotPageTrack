@@ -28,14 +28,13 @@ void SizeClassManager::remove_from_partial_list(Page *page){
 Page* SizeClassManager::get_a_page(){
     /* TODO: batch alloc? */
     void* raw_addr = arena.alloc_a_page();
-    /* V0.1: This should never be nullptr, alloc_a_page must be successful */
+    /* This should never be nullptr, alloc_a_page must be successful */
     if(raw_addr == nullptr){
         std::cerr<<RED<<"Arena out of memory!\n"<<RESET;
         exit(-1);
     }
 
     Page* page = init_page(raw_addr);
-    // TODO: adding and removing here? Or elsewhere?
     arena.add_to_lru(page);
     push_to_partial_list(page);
 
@@ -57,8 +56,8 @@ Page* SizeClassManager::init_page(void* raw_page_base){
     page->header.used = 0;
     page->header.next = nullptr;
     page->header.prev = nullptr;
-    page->header.lru_pointers.lru_prev = nullptr;
-    page->header.lru_pointers.lru_next = nullptr;
+    page->header.lru_prev = nullptr;
+    page->header.lru_next = nullptr;
     page->header.page_id = arena.get_page_id(raw_page_base);
     page->header.slot_size = this->slot_size;
 
@@ -83,27 +82,39 @@ Page* SizeClassManager::init_page(void* raw_page_base){
 }
 
 /* alloate a slot, if page becomes full, stop tracking the page */
-void* SizeClassManager::alloc(){
-    Page *page = partial_list_head;
+void* SizeClassManager::alloc() {
+    std::unique_lock<std::shared_mutex> write_lock(rw_lock);
 
-    /* SizeClass out of usable pages, ask page from the arena */
-    if(!page){
-        page = get_a_page();
+    if (partial_list_head != nullptr) {
+        Page *page = partial_list_head;
+        uint16_t slot_idx = page->header.first_free_idx;
+        
+        page->header.first_free_idx = page->next_free(slot_idx);
+        page->header.used++;
+
+        if(page->header.used == page->header.max_slots) {
+            remove_from_partial_list(page);
+        }
+        
+        return static_cast<void*>(page->get_slot_addr(slot_idx));
     }
 
-    uint16_t slot_idx = page->header.first_free_idx;
-    page->header.first_free_idx = page->next_free(slot_idx);
-    page->header.used++;
 
-    if(page->header.used == page->header.max_slots){
-        remove_from_partial_list(page);
-    }
+    write_lock.unlock(); 
+    Page* new_page = get_a_page();
+    write_lock.lock();
 
-    return static_cast<void*>(page->get_slot_addr(slot_idx));
+    uint16_t slot_idx = new_page->header.first_free_idx;
+    new_page->header.first_free_idx = new_page->next_free(slot_idx);
+    new_page->header.used++;
+
+    return static_cast<void*>(new_page->get_slot_addr(slot_idx));
 }
 
 /* allocate a slot if SCM have free space, never ask new page. Might fail */
 void* SizeClassManager::alloc_notrigger(){
+    std::unique_lock<std::shared_mutex> write_lock(rw_lock);
+
     Page* page = partial_list_head;
 
     if(!page) return nullptr;
@@ -121,6 +132,8 @@ void* SizeClassManager::alloc_notrigger(){
 
 /* free a slot, if page become free, return it to the arena*/
 void SizeClassManager::free(void* raw_addr){
+    std::unique_lock<std::shared_mutex> write_lock(rw_lock);
+
     uintptr_t addr = reinterpret_cast<uintptr_t>(raw_addr);
 
     uintptr_t page_addr = PAGE_ALIGN(addr);
@@ -146,5 +159,30 @@ void SizeClassManager::free(void* raw_addr){
     }
 
     return;
+}
+
+void SizeClassManager::quarantine_page(Page* page){
+    std::unique_lock<std::shared_mutex> write_lock(rw_lock);
+
+    if (page->header.prev){
+        page->header.prev->header.next = page->header.next;
+    }else{
+        partial_list_head = page->header.next; 
+    }
+    if (page->header.next){
+        page->header.next->header.prev = page->header.prev;
+    }
+    page->header.prev = nullptr;
+    page->header.next = nullptr;
+}
+
+void SizeClassManager::unquarantine_page(Page* page){
+    std::unique_lock<std::shared_mutex> write_lock(rw_lock);
+
+    page->header.prev = nullptr;
+    page->header.next = partial_list_head;
+
+    if(partial_list_head){ partial_list_head->header.prev = page; }
+    partial_list_head = page;
 }
 }// namespace imdb

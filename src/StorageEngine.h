@@ -12,9 +12,12 @@
 #include "ShardedHashmap.h"
 
 namespace imdb{
- 
 #define PAGE_HOT_SCALE 4  
 #define TABLE_END  0XFFFFFFFFFFFFFFFF
+
+// TODO: will the FIFO feature of TT makes this inefficient?
+#define TT_SHARDS 1024
+
 /* strcut RecordLoc(record location). Content in the translation table. 
  *
  * Record lookup is like: 
@@ -29,10 +32,11 @@ struct RecordLoc{
             union{
                 void* ram_addr;
                 size_t disk_offset;
-            }; // total 16 bytes **try to keep it small!**
+            }; // 8 bytes
             uint32_t size; // 4 bytes
             bool is_in_ram; // 1 byte
             // 3 bytes compiler padding
+            // total 16 bytes **try to keep it small!**
         }in_use;
 
         uint64_t next_free_idx;
@@ -65,6 +69,7 @@ struct DBConfig{
  */
 class StorageEngine{
     private:
+
         DBConfig config;
         Arena arena;
         DiskManager disk_manager;
@@ -79,14 +84,18 @@ class StorageEngine{
         uint64_t next_logical_id;
         /* translation table, bridge hashmap and record location. See comment at struct RecordLoc */
         std::vector<RecordLoc> translation_table;
-        
+        /* locks that protects TT's content. */
+        // TODO: proformance degrade as tt grows large?
+        std::shared_mutex tt_locks[TT_SHARDS];
+        /* lock that protects the internal free list in TT. Only used in entry allocation/free */
+        std::shared_mutex tt_meta_rw_lock;
+       
         /* tracks key -> translation_table index mappings */
         ShardedHashMap hashmap;
 
-        std::shared_mutex tt_scm_lock;
         void evict_cold_page();
         /* rescue hot record, and write other records to disk.*/
-        void page_hot_rescue(Page* victim_page);
+        void page_hot_rescue(Page* victim_page, bool &page_fully_cleared);
 
         /* --------------- helper functions -------------------------- */
 
@@ -94,17 +103,19 @@ class StorageEngine{
         uint8_t get_scm_index(size_t total_size);
         /* given an allocated slot, initialize it with the given logical id and payload 
          * don't check whether the size fits, nor whether the slot is allocated.     */
-        void init_slot_nocheck(void* slot_addr, uint64_t logical_id, const char* record, uint64_t record_size);
+        void fill_slot_nocheck(void* slot_addr, uint64_t logical_id, const char* record, uint64_t record_size);
+        /* use to check whether the key->logical id mapping obtained from last query is still valid */
+        bool hashmap_recheck(const std::string &key, uint64_t expected_id);
 
-        /* Handles updating a record that already exists in the Translation Table */
-        bool update_record(uint64_t logical_id, const char* record, uint64_t record_size);
-        /* Handles allocating and inserting a brand new record */
+        /* Update a record that already exists in the Translation Table */
+        bool update_record(const std::string &key, uint64_t logical_id, const char* record, uint64_t record_size);
+        /* allocate and insert a new record */
         bool insert_record(const std::string& key, const char* record, uint64_t record_size, uint64_t &collided_id);
 
 
         /* -------- translation table operations -------- */
 
-        uint64_t add_to_table(const RecordLoc& new_loc); // on success, return the inserted data's logical id
+        uint64_t add_to_table(RecordLoc& new_loc); // on success, return the inserted data's logical id
         void remove_from_table(uint64_t logical_id);
         /* grow the table by factor config.table_grow_speed */
         void grow_table();

@@ -34,8 +34,8 @@ struct Page{
         struct{
             Page* lru_prev;
             Page* lru_next;
-        }lru_pointers;
-        uint32_t page_id;
+        };
+        uint32_t page_id; //TODO: delete this?
 
         uint16_t first_free_idx;
 
@@ -49,9 +49,6 @@ struct Page{
 
     /* array that tracks records usage. Recently accessed record should have is_hot bit == 1.
      * Record header is 8 bytes, so SC begins with 16 bytes. Making a page containing at most 254 records.
-     *
-     * Centralized is_hot means slot lock won't protect them. is_hot is strictly 1 bit to utilize CPU atomic operations,
-     * which trades off is_hot accuracy for sweeper's being able to discover metadata super fast.
      */
     std::atomic<uint64_t> is_hot[IS_HOT_ARR_LENGTH];
 
@@ -113,8 +110,6 @@ class Arena{
         void* alloc_a_page();
         /* simply set the bitmap to mark page free */
         void free_a_page(void *raw_page_base);
-        /* translate a raw address to page id */
-        uint32_t get_page_id(void* raw_addr);
         /* don't check matermarks, never sleep. Might return nullptr. */
         void* alloc_a_page_nocheck();
 
@@ -127,6 +122,9 @@ class Arena{
         bool needs_sweeping() const { return used_pages.load() >= low_watermark; }
         bool is_critical() const { return used_pages.load() >= min_watermark; }
         bool is_safe() const { return used_pages.load() <= high_watermark; }
+
+        /* translate a raw address to page id */
+        uint32_t get_page_id(void* raw_addr);
 };
 
 /* helper function. The functions are not a member of SCM for flexibilty reasons */
