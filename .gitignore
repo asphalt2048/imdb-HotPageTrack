@@ -1,5 +1,7 @@
-/.vscode
+.vscode/
 
-/data
+data/
+
+uffd-demo/
 
 *.exe
