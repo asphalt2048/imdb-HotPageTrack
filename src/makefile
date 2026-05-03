@@ -4,7 +4,7 @@
 CXX = g++
 
 # The flags (c++17 and pthread are required for your engine)
-CXXFLAGS = -std=c++17 -pthread -Wall -O3
+CXXFLAGS = -std=c++17 -pthread -Wall -O0 -g
 
 # The name of your database executable
 TARGET = imdb_server

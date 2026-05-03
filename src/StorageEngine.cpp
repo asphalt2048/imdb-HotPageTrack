@@ -69,7 +69,8 @@ uint8_t StorageEngine::get_scm_index(uint64_t total_size) {
     if (total_size <= 128) return 3;
     if (total_size <= 256) return 4;
     
-    return 255; // Error/Too large
+    std::cerr<<RED<<"Out of Bound\n"<<RESET;
+    exit(-1);
 }
 
 /* given an allocated slot, initialize it with the given logical id and payload 
@@ -89,13 +90,20 @@ bool StorageEngine::hashmap_recheck(const std::string &key, uint64_t expected_id
     return true;
 }
 
-bool StorageEngine::update_record(const std::string &key, uint64_t logical_id, const char* record, uint64_t record_size) {
+bool StorageEngine::update_record(const std::string &key, uint64_t logical_id, const char* record, uint64_t record_size){
     size_t real_size = record_size + sizeof(RecordHeader);
+
+    /* DB interface must pre alloc space before holding TT's lock.
+     * Otherwise there will be deadlock when OOM happens.
+     */
+    SizeClassManager &scm = SCMs[get_scm_index(real_size)];
+    void* pre_alloc_slot = scm.alloc();
 
     size_t lock_idx = logical_id % TT_SHARDS;
     std::unique_lock<std::shared_mutex> write_lock(tt_locks[lock_idx]);
 
     if(!hashmap_recheck(key, logical_id)){
+        scm.free(pre_alloc_slot);
         return false;
     }
 
@@ -108,6 +116,7 @@ bool StorageEngine::update_record(const std::string &key, uint64_t logical_id, c
 
         /* case 1.1: New data fits in the existing slot. Update in-place. */
         if( real_size <= old_size){
+            scm.free(pre_alloc_slot);
             fill_slot_nocheck(slot_addr, logical_id, record, record_size);
             mark_slot_hot(slot_addr);
             loc.in_use.size = record_size;
@@ -115,31 +124,25 @@ bool StorageEngine::update_record(const std::string &key, uint64_t logical_id, c
         }
         /* case 1.2: New data outgrows the current slot. Reallocate. */
         else{
-            SizeClassManager &scm = SCMs[get_scm_index(real_size)];
-            void* new_slot = scm.alloc();
-
-            fill_slot_nocheck(new_slot, logical_id, record, record_size);
-            mark_slot_hot(new_slot);
+            fill_slot_nocheck(pre_alloc_slot, logical_id, record, record_size);
+            mark_slot_hot(pre_alloc_slot);
 
             SizeClassManager &old_scm = SCMs[get_scm_index(old_size)];
             old_scm.free(slot_addr);
             mark_slot_cold(slot_addr);
 
-            loc.in_use.ram_addr = new_slot;
+            loc.in_use.ram_addr = pre_alloc_slot;
             loc.in_use.size = record_size;
             return true;
         }
     }
     /* case 2: record is in disk */
     else{
-        SizeClassManager &scm = SCMs[get_scm_index(real_size)];
-        void* new_slot = scm.alloc();
-
-        fill_slot_nocheck(new_slot, logical_id, record, record_size);
-        mark_slot_hot(new_slot);
+        fill_slot_nocheck(pre_alloc_slot, logical_id, record, record_size);
+        mark_slot_hot(pre_alloc_slot);
 
         loc.in_use.is_in_ram = true;
-        loc.in_use.ram_addr = new_slot;
+        loc.in_use.ram_addr = pre_alloc_slot;
         loc.in_use.size = record_size;
         return true;
     }
@@ -155,6 +158,7 @@ bool StorageEngine::insert_record(const std::string& key, const char* record, ui
     new_loc.in_use.ram_addr = new_slot_addr;
 
     uint64_t new_logical_id = add_to_table(new_loc);
+    fill_slot_nocheck(new_slot_addr, new_logical_id, record, record_size);
     
     /* Beware of insert race:
      * Two insert with same key fire at the same time. The loser in the race must roll back.
@@ -165,8 +169,7 @@ bool StorageEngine::insert_record(const std::string& key, const char* record, ui
         remove_from_table(new_logical_id);
         return false;
     }
-
-    fill_slot_nocheck(new_slot_addr, new_logical_id, record, record_size);
+       
     mark_slot_hot(new_slot_addr);
 
     return true;
@@ -215,16 +218,20 @@ bool StorageEngine::put(const std::string& key, const char* record, uint64_t rec
     }
 }
 
-bool StorageEngine::get(const std::string& key, char* buf, uint64_t& record_size){
+bool StorageEngine::get(const std::string& key, char* buf, uint64_t& out_record_size){
     uint64_t logical_id;
     bool exist = hashmap.get(key, logical_id);
-    if(!exist) {std::cerr<<RED<<"Get record with key: "<<key<<" error: record not exists\n"<<RESET; return false;}
+    if(!exist) {
+        std::cerr<<RED<<"Get record with key: "<<key<<" error: record not exists\n"<<RESET; 
+        return false;
+    }
 
     size_t lock_idx = logical_id % TT_SHARDS;
+    
+    // 1. FAST PATH: Start with a READ lock
     std::shared_lock<std::shared_mutex> read_lock(tt_locks[lock_idx]);
 
     if(!hashmap_recheck(key, logical_id)){
-        // the mapping has been changed, means the old record has been deleted
         return false;
     }
 
@@ -235,23 +242,53 @@ bool StorageEngine::get(const std::string& key, char* buf, uint64_t& record_size
         char* payload = header->get_payload();
 
         std::memcpy(buf, payload, loc.in_use.size);
-        record_size = loc.in_use.size;
-
+        out_record_size = loc.in_use.size;
         mark_slot_hot(loc.in_use.ram_addr);
 
         return true;
     }
-    else{
-        // Data is on disk. 
-        size_t payload_offset = loc.in_use.disk_offset + sizeof(RecordHeader);
-        
-        // TODO: swap data in
-        bool success = disk_manager.read_record(payload_offset, buf, loc.in_use.size);
-        if(!success) return false;
 
-        record_size = loc.in_use.size;
-        return true;
+    // 2. SLOW PATH (Disk -> RAM Promotion)
+    uint64_t record_size = loc.in_use.size;
+    size_t payload_offset = loc.in_use.disk_offset + sizeof(RecordHeader);
+    
+    // Drop the read lock to avoid deadlocks while asking the Arena for memory
+    read_lock.unlock();
+
+    SizeClassManager &scm = SCMs[get_scm_index(record_size + sizeof(RecordHeader))];
+    void* pre_alloc_slot = scm.alloc();
+
+    // making changes to TT, must upgrade lock to writelock
+    std::unique_lock<std::shared_mutex> write_lock(tt_locks[lock_idx]);
+
+    if(!hashmap_recheck(key, logical_id)){ scm.free(pre_alloc_slot); return false; }
+    
+    if(loc.in_use.is_in_ram){ 
+        // Someone beat us to it! Just read from RAM and give our unused slot back.
+        RecordHeader* header = reinterpret_cast<RecordHeader*>(loc.in_use.ram_addr);
+        std::memcpy(buf, header->get_payload(), loc.in_use.size);
+        out_record_size = loc.in_use.size;
+        mark_slot_hot(loc.in_use.ram_addr);
+        
+        scm.free(pre_alloc_slot); 
+        return true; 
+    } 
+
+    // Safe to read from disk and promote!
+    bool success = disk_manager.read_record(payload_offset, buf, loc.in_use.size);
+    if(!success){ 
+        scm.free(pre_alloc_slot); 
+        return false; 
     }
+    out_record_size = loc.in_use.size;
+
+    fill_slot_nocheck(pre_alloc_slot, logical_id, buf, loc.in_use.size);
+    mark_slot_hot(pre_alloc_slot);
+
+    loc.in_use.is_in_ram = true;
+    loc.in_use.ram_addr = pre_alloc_slot;
+
+    return true;
 }
 
 bool StorageEngine::del(const std::string& key){
@@ -301,25 +338,34 @@ void StorageEngine::page_hot_rescue(Page* victim_page, bool &page_fully_cleared)
     page_fully_cleared = true;
 
     /* TODO: there is a TOCTOU bug, that the victim page become empty and 
-     * returned to arena. Since arena uses a bitmap, so refree a page won't
-     * cause a double-free problem. We just waste a few CPU iterating through an
-     * empty page
+     * returned to arena before sweeper is able to evict it. Since arena uses a bitmap, 
+     * so refree a page won't cause a double-free problem. We just waste a few CPU 
+     * iterating through an empty page
      */
 
     // isolate the page so that no insert will use this page
     scm.quarantine_page(victim_page);
 
     for (uint16_t i = 0; i < max_slots; i++) {
-        /* TODO: free slot bug: don't know whether the slot is in use or not.
-         * we would want to skip empty slot. But there is no way to know that
+        /* Partial In-Use Slot problem: 
+         * An insert might have allocated a slot, but have not written logical id
+         * I call this a "partial in-use slot". 
+         * For slot with is_allocated bit = 1, must double check to know whether it's
+         * partial in-use or not
          */
 
         char* slot_addr = victim_page->get_slot_addr(i);
+        uint16_t slot_idx = victim_page->get_slot_idx_nocheck(slot_addr);
+
+        /* skip the slot if it's definitely free.
+         * 
+         */
+        if(!get_allocated_bit(victim_page, slot_idx)){ continue; }
+
         RecordHeader* header = reinterpret_cast<RecordHeader*>(slot_addr);
         uint64_t logical_id = header->logical_id;
 
-        // must do this check.
-        if (logical_id < translation_table.size()) {
+        if (logical_id < translation_table.size()){
 
             size_t lock_idx = logical_id % TT_SHARDS;
             std::unique_lock<std::shared_mutex> write_lock(tt_locks[lock_idx], std::try_to_lock);
@@ -340,15 +386,15 @@ void StorageEngine::page_hot_rescue(Page* victim_page, bool &page_fully_cleared)
 
             RecordLoc& loc = translation_table[logical_id];
             
-            /* A unprincipled solution to the "free slot bug" mentioned above.
-             * If a slot is free, where is in ram_addr will become next_free_idx,
-             * there is only a tiny chance that those are equal.
+            /* A unprincipled solution to the "partial in-use slot" mentioned above. partial in-use 
+             * slot will have a garbage logical id. Which can't pass the following check
              */
             if (loc.in_use.is_in_ram && loc.in_use.ram_addr == slot_addr){
+                // It's a fully in-use slot!
+
+                size_t total_size = loc.in_use.size + sizeof(RecordHeader);
                 // --- BEST EFFORT RESCUE ---
                 if (config.enable_hot_rescue && is_slot_hot(slot_addr)) {
-                    size_t total_size = loc.in_use.size + sizeof(RecordHeader);
-                    
                     /* TRY to ask free space in SCM. Might fail. 
                      * If fail, let the record die(write to disk).
                      *
@@ -360,24 +406,33 @@ void StorageEngine::page_hot_rescue(Page* victim_page, bool &page_fully_cleared)
                         std::memcpy(new_slot, slot_addr, total_size);
                         loc.in_use.ram_addr = new_slot;
                         mark_slot_cold(new_slot); 
+
+                        clear_allocated_bit(victim_page, slot_idx);
+                        victim_page->header.used.fetch_sub(1);
                         continue;
                     }
                     // TODO: do we lift the 'new home' in lru?
                 }
 
                 // --- COLD EVICTION (OR RESCUE FAILED) ---
-                size_t total_size = loc.in_use.size + sizeof(RecordHeader);
                 size_t disk_offset = disk_manager.write_record(slot_addr, total_size);
-                
                 loc.in_use.is_in_ram = false;
                 loc.in_use.disk_offset = disk_offset;
+
+                clear_allocated_bit(victim_page, slot_idx);
+                victim_page->header.used.fetch_sub(1);
             }
-        }
+            else{
+                // We meet a partial in-use slot
+                page_fully_cleared = false;
+            }
+        }else{ page_fully_cleared = false; }
     }
     if(!page_fully_cleared){
         scm.unquarantine_page(victim_page);
     }
 }
+
 void StorageEngine::evict_cold_page() {
     while (true) {
         Page* victim_page = reinterpret_cast<Page*>(arena.get_lru_tail());
@@ -399,13 +454,13 @@ void StorageEngine::evict_cold_page() {
         }
         
         /* page selected as evcition target */
-        bool page_fully_cleared;
+        bool page_fully_cleared = false;
         page_hot_rescue(victim_page, page_fully_cleared);
 
         /* reclaim the page if fully cleared */
         if(page_fully_cleared){
-            uint8_t scm_idx = get_scm_index(victim_page->header.slot_size);
-            SCMs[scm_idx].reclaim_evicted_page(victim_page);
+            arena.remove_from_lru(reinterpret_cast<void*>(victim_page));
+            arena.free_a_page(reinterpret_cast<void*>(victim_page));
         }
 
         if(arena.is_safe()){

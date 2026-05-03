@@ -17,6 +17,7 @@
 #define RESET   "\033[0m"   /* reset color */ 
 #define PAGE_ALIGN(x) ((x) & ~(4096ULL - 1))
 #define IS_HOT_ARR_LENGTH 4
+#define IS_ALLOCATED_ARR_LENGHT 4
 
 /* The manager of arena.
  * V1.0: uses bitmap to track free pages
@@ -28,20 +29,18 @@ struct Page{
 
     struct{
         struct{
-            Page* prev;
-            Page* next;
+            Page* prev{nullptr};
+            Page* next{nullptr};
         };
         struct{
-            Page* lru_prev;
-            Page* lru_next;
+            Page* lru_prev{nullptr};
+            Page* lru_next{nullptr};
         };
-        uint32_t page_id; //TODO: delete this?
-
-        uint16_t first_free_idx;
+        // uint32_t page_id; //TODO: delete this?
 
         uint16_t slot_size;
         uint16_t max_slots; // dynamically set by SizeClassManager::init_page()
-        uint16_t used;    // counter of in-use slots
+        std::atomic<uint16_t> used;    // counter of in-use slots
 
         /* The size header takes. Calculated dynamically at init_page() */
         uint16_t header_reserved;
@@ -51,18 +50,17 @@ struct Page{
      * Record header is 8 bytes, so SC begins with 16 bytes. Making a page containing at most 254 records.
      */
     std::atomic<uint64_t> is_hot[IS_HOT_ARR_LENGTH];
+    /* TODO: added this just to prevent a deadlock bug. See StorageEngine.cpp: page_hot_rescue. Free slot bug */
+    std::atomic<uint64_t> is_allocated[IS_ALLOCATED_ARR_LENGHT];
 
     /* ------------------Helper functions--------------------- */
-    inline uint16_t get_slot_id_nocheck(void* slot_addr){
+    /* return the idx of slot. Perform zero check on the slot addr passed in */
+    inline uint16_t get_slot_idx_nocheck(void* slot_addr){
         uintptr_t slot_addr_ = reinterpret_cast<uintptr_t>(slot_addr);
         return ((slot_addr_ - PAGE_ALIGN(slot_addr_)) - header.header_reserved) / header.slot_size;
     }
     inline char* get_slot_addr(uint16_t idx){
         return reinterpret_cast<char*>(this) + header.header_reserved + (idx * header.slot_size);
-    }
-    /* slots in managed by internal free list. This function returns the reference to the "next_free" pointer in a slot */
-    inline uint16_t& next_free(uint16_t idx){
-        return *reinterpret_cast<uint16_t*>(get_slot_addr(idx));
     }
 };
 
@@ -77,8 +75,7 @@ class Arena{
         static constexpr size_t BITMAP_SIZE = TOTAL_PAGES / 64;
         static_assert(TOTAL_PAGES % 64 == 0, "Arena size must be a multiple of 64 pages");
 
-        uint64_t bitmap[BITMAP_SIZE];
-        std::mutex bitmap_mutex;
+        std::atomic<uint64_t> bitmap[BITMAP_SIZE];
 
         /* The beginning address of arena */
         void *arena_base;
@@ -87,7 +84,7 @@ class Arena{
         /* record the idx where we found last free page
          * next search won't start from idx 0, beneficial for continuous alloc 
          */
-        size_t last_searched_idx;
+        std::atomic<size_t> last_searched_idx;
 
         size_t high_watermark;
         size_t min_watermark;
@@ -126,15 +123,4 @@ class Arena{
         /* translate a raw address to page id */
         uint32_t get_page_id(void* raw_addr);
 };
-
-/* helper function. The functions are not a member of SCM for flexibilty reasons */
-void mark_slot_hot(void* slot_addr);
-void mark_slot_cold(void* slot_addr);
-bool is_slot_hot(void* slot_addr);
-// return the total hot slot count
-uint16_t get_page_hot_count(Page* page);
-// clear is_hot
-void clear_page_hot_bits(Page* page);
-/* helper function. Input: addr of a slot. Output: struct page the slot belonging to */
-Page* get_struct_page(void* slot_addr);
 }// namespace imdb

@@ -5,6 +5,14 @@
 
 namespace imdb{
 void SizeClassManager::push_to_partial_list(Page *page){
+    if (page->header.next != nullptr || 
+        page->header.prev != nullptr || partial_list_head == page) {
+        return; // Already in list
+    }
+    if(page->header.used.load() == page->header.max_slots){
+        return; // it's a full page
+    }
+
     page->header.prev = nullptr;
     page->header.next = partial_list_head;
 
@@ -13,6 +21,10 @@ void SizeClassManager::push_to_partial_list(Page *page){
 }
 
 void SizeClassManager::remove_from_partial_list(Page *page){
+    if(page->header.next == nullptr && page->header.prev == nullptr && partial_list_head != page){
+        return; // not in list
+    }
+
     if (page->header.prev){
         page->header.prev->header.next = page->header.next;
     }else{
@@ -26,7 +38,7 @@ void SizeClassManager::remove_from_partial_list(Page *page){
 }
 
 Page* SizeClassManager::get_a_page(){
-    /* TODO: batch alloc? */
+    /* TODO: massive insert will cause multiple thread hitting this simultaneously */
     void* raw_addr = arena.alloc_a_page();
     /* This should never be nullptr, alloc_a_page must be successful */
     if(raw_addr == nullptr){
@@ -35,16 +47,11 @@ Page* SizeClassManager::get_a_page(){
     }
 
     Page* page = init_page(raw_addr);
-    arena.add_to_lru(page);
-    push_to_partial_list(page);
 
     return page;
 }
 
 void SizeClassManager::return_a_page(Page* page){
-    if(page->header.used < page->header.max_slots){
-        remove_from_partial_list(page);
-    }
     arena.remove_from_lru(page);
     arena.free_a_page(reinterpret_cast<void *>(page));
 }
@@ -52,13 +59,12 @@ void SizeClassManager::return_a_page(Page* page){
 /* init a page with the correct format, setup interal free slots list */
 Page* SizeClassManager::init_page(void* raw_page_base){
     Page* page = reinterpret_cast<Page*>(raw_page_base);
-    page->header.first_free_idx = 0;
     page->header.used = 0;
     page->header.next = nullptr;
     page->header.prev = nullptr;
     page->header.lru_prev = nullptr;
     page->header.lru_next = nullptr;
-    page->header.page_id = arena.get_page_id(raw_page_base);
+    // page->header.page_id = arena.get_page_id(raw_page_base);
     page->header.slot_size = this->slot_size;
 
     /* dynamically sets up header_reserved and max_slots */
@@ -68,45 +74,76 @@ Page* SizeClassManager::init_page(void* raw_page_base){
     page->header.max_slots = (Page::PAGE_SIZE - page->header.header_reserved) / slot_size;
 
     /* setup is_hot array */
-    for(int i=0; i < 4; i++){
+    for(int i=0; i < IS_HOT_ARR_LENGTH; i++){
         page->is_hot[i].store(0ULL, std::memory_order_relaxed);
     }
-
-    /* setup slots' internal free list */
-    for(int i=0; i<page->header.max_slots - 1; i++){
-        page->next_free(i) = i+1;
+    /* setup is_allocated array */
+    for(int i=0; i < IS_ALLOCATED_ARR_LENGHT; i++){
+        page->is_allocated[i].store(0ULL, std::memory_order_relaxed);
     }
-    page->next_free(page->header.max_slots-1) = SLOT_END;
 
     return page;
 }
 
+uint16_t SizeClassManager::get_free_slot(Page* page){
+    uint16_t free_slot_idx = SLOT_END;
+
+    for (int i = 0; i < IS_ALLOCATED_ARR_LENGHT; i++) {
+        uint64_t chunk = page->is_allocated[i].load(std::memory_order_acquire);
+        
+        // If chunk is not entirely full (i.e not 0xFFFFFFFFFFFFFFFF)
+        if (chunk != ~0ULL) {
+            uint64_t inverted = ~chunk;
+            int first_free_bit = __builtin_ctzll(inverted); 
+            
+            uint16_t idx = (i * 64) + first_free_bit;
+            
+            // is_allocated array length might be larger that actual max_slot
+            // do this check to ensure safety
+            if (idx < page->header.max_slots) {
+                free_slot_idx = idx;
+                break;
+            }
+        }
+    }
+
+    if (free_slot_idx == SLOT_END) {
+        std::cerr<<RED<< "Error: SCM: try to alloc slot on a full page\n"<<RESET; exit(-1); 
+    }
+    return free_slot_idx;
+}
+
 /* alloate a slot, if page becomes full, stop tracking the page */
-void* SizeClassManager::alloc() {
+void* SizeClassManager::alloc(){
     std::unique_lock<std::shared_mutex> write_lock(rw_lock);
 
     if (partial_list_head != nullptr) {
         Page *page = partial_list_head;
-        uint16_t slot_idx = page->header.first_free_idx;
+        uint16_t slot_idx = get_free_slot(page);
         
-        page->header.first_free_idx = page->next_free(slot_idx);
-        page->header.used++;
+        page->header.used.fetch_add(1);
+        set_allocated_bit(page, slot_idx);
 
-        if(page->header.used == page->header.max_slots) {
+        if(page->header.used.load() == page->header.max_slots) {
             remove_from_partial_list(page);
         }
         
         return static_cast<void*>(page->get_slot_addr(slot_idx));
     }
 
-
     write_lock.unlock(); 
+    // TODO: get page might sleep, and sweeper might need this lock. 
     Page* new_page = get_a_page();
     write_lock.lock();
 
-    uint16_t slot_idx = new_page->header.first_free_idx;
-    new_page->header.first_free_idx = new_page->next_free(slot_idx);
-    new_page->header.used++;
+    uint16_t slot_idx = get_free_slot(new_page);
+    new_page->header.used.fetch_add(1);
+    set_allocated_bit(new_page, slot_idx);
+
+    if (new_page->header.used < new_page->header.max_slots) {
+        push_to_partial_list(new_page);
+    }
+    arena.add_to_lru(new_page);
 
     return static_cast<void*>(new_page->get_slot_addr(slot_idx));
 }
@@ -117,11 +154,11 @@ void* SizeClassManager::alloc_notrigger(){
 
     Page* page = partial_list_head;
 
-    if(!page) return nullptr;
+    if(page == nullptr) return nullptr;
 
-    uint16_t slot_idx = page->header.first_free_idx;
-    page->header.first_free_idx = page->next_free(slot_idx);
-    page->header.used++;
+    uint16_t slot_idx = get_free_slot(page);
+    page->header.used.fetch_add(1);
+    set_allocated_bit(page, slot_idx);
 
     if(page->header.used == page->header.max_slots){
         remove_from_partial_list(page);
@@ -131,30 +168,31 @@ void* SizeClassManager::alloc_notrigger(){
 }
 
 /* free a slot, if page become free, return it to the arena*/
-void SizeClassManager::free(void* raw_addr){
+void SizeClassManager::free(void* slot_addr){
     std::unique_lock<std::shared_mutex> write_lock(rw_lock);
 
-    uintptr_t addr = reinterpret_cast<uintptr_t>(raw_addr);
+    uintptr_t slot_addr_ = reinterpret_cast<uintptr_t>(slot_addr);
 
-    uintptr_t page_addr = PAGE_ALIGN(addr);
-    Page *page = reinterpret_cast<Page*>(page_addr);
+    uintptr_t page_base = PAGE_ALIGN(slot_addr_);
+    Page *page = reinterpret_cast<Page*>(page_base);
 
-    size_t offset = addr - page_addr;
+    if(page->header.slot_size != slot_size){
+        std::cerr<<RED<<"Error: call free on wrong SCM\n"<<RESET; exit(-1);
+    }
+
+    size_t offset = slot_addr_ - page_base;
     uint16_t slot_idx = (offset - page->header.header_reserved) / page->header.slot_size;
 
-    /* link the slot back to free list */
-    page->next_free(slot_idx) = page->header.first_free_idx;
-    page->header.first_free_idx = slot_idx;
+    clear_allocated_bit(page, slot_idx);
+    uint16_t old_used = page->header.used.fetch_sub(1);
 
-    /* if page becomes partial, put to partial list */
-    if(page->header.used == page->header.max_slots){
+    if(old_used == page->header.max_slots){
         push_to_partial_list(page);
     }
 
-    page->header.used--;
-
-    /* if page becomes empty, return it to the arena */
-    if(page->header.used == 0){
+    if(old_used == 1){
+        // TODO: race condition with sweeper
+        remove_from_partial_list(page);
         return_a_page(page);
     }
 
@@ -164,25 +202,100 @@ void SizeClassManager::free(void* raw_addr){
 void SizeClassManager::quarantine_page(Page* page){
     std::unique_lock<std::shared_mutex> write_lock(rw_lock);
 
-    if (page->header.prev){
-        page->header.prev->header.next = page->header.next;
-    }else{
-        partial_list_head = page->header.next; 
-    }
-    if (page->header.next){
-        page->header.next->header.prev = page->header.prev;
-    }
-    page->header.prev = nullptr;
-    page->header.next = nullptr;
+    remove_from_partial_list(page);
 }
 
 void SizeClassManager::unquarantine_page(Page* page){
     std::unique_lock<std::shared_mutex> write_lock(rw_lock);
 
-    page->header.prev = nullptr;
-    page->header.next = partial_list_head;
+    push_to_partial_list(page);
+}
 
-    if(partial_list_head){ partial_list_head->header.prev = page; }
-    partial_list_head = page;
+
+/*-------------------------Helper functions---------------------------------------*/
+/* They are not bind to a size class(not a member funtion) for flexibilty reasons */
+
+// TODO: lock free or not? Does user need to hold lock when calling this function?
+// (this is a write to page, a write need a lock)
+// false positive acceptive?
+void mark_slot_hot(void* slot_addr){
+    Page* page = get_struct_page(slot_addr);
+    uint16_t slot_id = page->get_slot_idx_nocheck(slot_addr);
+
+    size_t arr_idx = slot_id / 64;
+    size_t bit_idx = slot_id % 64;
+
+    page->is_hot[arr_idx].fetch_or(1ULL << bit_idx, std::memory_order_relaxed);
+};
+
+// TODO: lock free or not? Does user need to hold lock when calling this function?
+// (this is a write to page, a write need a lock)
+void mark_slot_cold(void* slot_addr){
+    Page* page = get_struct_page(slot_addr);
+    uint16_t slot_id = page->get_slot_idx_nocheck(slot_addr);
+
+    size_t arr_idx = slot_id / 64;
+    size_t bit_idx = slot_id % 64;
+
+    page->is_hot[arr_idx].fetch_and(~(1ULL << bit_idx), std::memory_order_relaxed);
+};
+
+bool is_slot_hot(void* slot_addr){
+    Page* page = get_struct_page(slot_addr);
+    uint16_t slot_id = page->get_slot_idx_nocheck(slot_addr);
+
+    size_t arr_idx = slot_id / 64;
+    size_t bit_idx = slot_id % 64;
+
+    return page->is_hot[arr_idx].load(std::memory_order_relaxed) & (1ULL << bit_idx);
+}
+
+uint16_t get_page_hot_count(Page* page) {
+    uint16_t total_hot = 0;
+    for (int i = 0; i < IS_HOT_ARR_LENGTH; i++) {
+        // no lock. 'slightly false' value is acceptable
+        uint64_t chunk = page->is_hot[i].load(std::memory_order_relaxed);
+        total_hot += __builtin_popcountll(chunk);
+    }
+    return total_hot;
+}
+
+void clear_page_hot_bits(Page* page) {
+    for (int i = 0; i < 4; i++) {
+        page->is_hot[i].store(0ULL, std::memory_order_relaxed);
+    }
+}
+
+Page* get_struct_page(void* slot_addr){
+    uintptr_t slot_addr_ = reinterpret_cast<uintptr_t>(slot_addr);
+    uintptr_t page_base = PAGE_ALIGN(slot_addr_);
+
+    return reinterpret_cast<Page*>(page_base);
+}
+
+/* Mark a slot as permanently reserved. Called immediately during SCM alloc() */
+void set_allocated_bit(Page* page, uint16_t slot_idx){
+    size_t arr_idx = slot_idx / 64;
+    size_t bit_idx = slot_idx % 64;
+    
+    // Use release semantics so the bit is set BEFORE the thread starts writing data
+    page->is_allocated[arr_idx].fetch_or(1ULL << bit_idx, std::memory_order_release);
+}
+
+/* Clear the reservation. Called during SCM free() */
+void clear_allocated_bit(Page* page, uint16_t slot_idx){
+    size_t arr_idx = slot_idx / 64;
+    size_t bit_idx = slot_idx % 64;
+    
+    page->is_allocated[arr_idx].fetch_and(~(1ULL << bit_idx), std::memory_order_release);
+}
+
+/* Check if a slot is currently held by an active thread. Called by Sweeper */
+bool get_allocated_bit(Page* page, uint16_t slot_idx){
+    size_t arr_idx = slot_idx / 64;
+    size_t bit_idx = slot_idx % 64;
+    
+    // Use acquire semantics to guarantee we see the most up-to-date bit state
+    return (page->is_allocated[arr_idx].load(std::memory_order_acquire) & (1ULL << bit_idx)) != 0;
 }
 }// namespace imdb

@@ -76,4 +76,7 @@ CV requires the mutex to be hold before wait() and signal() is called. Why? To p
 
 ## slotted page used by B+ tree DB
 
-## std::memory_order_
+## std::memory_order_relaxed?
+
+## The Rule of Concurrency
+Never publish an object to a globally visible data structure (LRU, Partial List, Hashmap) until it is in a 100% valid, secure state. A page is not secure until the creating thread has claimed at least one slot on it.

@@ -37,10 +37,17 @@ class SizeClassManager{
         void push_to_partial_list(Page *page);
         void remove_from_partial_list(Page *page);
 
+        /* ask a page from arena. Might sleep */
         Page* get_a_page();
+        /* remove from lru and return the page */
         void return_a_page(Page* page);
 
-        /* init a page with the correct format, setup interal free slots list */
+        
+        /* Input should be a partial page. Returns the first free slot's idx. 
+         * Kill the program when handed a full page */
+        uint16_t get_free_slot(Page* page);
+
+        /* Helper function. init a page with the correct format, setup interal free slots list */
         Page* init_page(void* raw_page_base);
 
     public:
@@ -59,17 +66,21 @@ class SizeClassManager{
         void quarantine_page(Page* page);
         /* same as push_to_partial_list, used by sweeper to return a not fully cleared page */
         void unquarantine_page(Page* page);
-
-        /* Called ONLY by the Sweeper when a page is being forcefully evicted to disk.
-         * This is not a confortable solution. As sweeper have to touch a SCM when evicting a page, 
-         * even though it touch it only to call this function.
-         */
-        void reclaim_evicted_page(Page* page) {
-            if (page->header.used > 0 && page->header.used < page->header.max_slots) {
-                remove_from_partial_list(page);
-            }
-            arena.remove_from_lru(reinterpret_cast<void*>(page));
-            arena.free_a_page(reinterpret_cast<void*>(page));
-        }
 };
+
+/* helper function. The functions are not a member of SCM for flexibilty reasons */
+void mark_slot_hot(void* slot_addr);
+void mark_slot_cold(void* slot_addr);
+bool is_slot_hot(void* slot_addr);
+// return the total hot slot count
+uint16_t get_page_hot_count(Page* page);
+// clear is_hot
+void clear_page_hot_bits(Page* page);
+/* helper function. Input: addr of a slot. Output: struct page the slot belonging to */
+Page* get_struct_page(void* slot_addr);
+/* set the is_allocated bit */
+void set_allocated_bit(Page* page, uint16_t slot_idx);
+/* clear is_allcated bit */
+void clear_allocated_bit(Page* page, uint16_t slot_idx);
+bool get_allocated_bit(Page* page, uint16_t slot_idx);
 }// namespace imdb

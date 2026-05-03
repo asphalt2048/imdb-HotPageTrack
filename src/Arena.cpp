@@ -25,30 +25,29 @@ Arena::Arena(){
 Arena::~Arena(){ munmap(arena_base, ARENA_SIZE); }
 
 void* Arena::alloc_a_page_nocheck(){
-    for(size_t i = 0; i<BITMAP_SIZE; i++){
-        size_t idx = (last_searched_idx + i) % BITMAP_SIZE;
+    size_t local_start = last_searched_idx.load(std::memory_order_relaxed);
 
-        /* bitmap[idx] is not full, i.e. not 0xFFFFFFFFFFFFFFFF */
-        bitmap_mutex.lock();
-        if(bitmap[idx] != ~0ULL){
-            unsigned int free_bit = __builtin_ffsll(~bitmap[idx]) - 1;
-            bitmap[idx] |= (1ULL << free_bit);
-
-            // unlock after setting the bit to minimize the critical section
-            bitmap_mutex.unlock();
-
-            last_searched_idx = idx;
-
-            size_t page_id = 64*idx + free_bit;
-            uintptr_t page_base_addr  = reinterpret_cast<uintptr_t>(arena_base) + page_id*PAGE_SIZE;
-
-            used_pages.fetch_add(1);
+    for (size_t i = 0; i < BITMAP_SIZE; i++) {
+        size_t idx = (local_start + i) % BITMAP_SIZE;
+        
+        uint64_t chunk = bitmap[idx].load(std::memory_order_acquire);
+        
+        // Spin lock-free on this specific chunk until we claim a bit or it fills up
+        while (chunk != ~0ULL) {
+            int first_free_bit = __builtin_ctzll(~chunk);
+            uint64_t new_chunk = chunk | (1ULL << first_free_bit);
             
-            return reinterpret_cast<void *>(page_base_addr);
-        }
-        else{
-            // check next one, don't forget to unlock before continue
-            bitmap_mutex.unlock();
+            // Try to atomically swap our modified chunk into the array
+            if (bitmap[idx].compare_exchange_weak(chunk, new_chunk, std::memory_order_release, std::memory_order_relaxed)){
+                
+                last_searched_idx.store(idx, std::memory_order_relaxed);
+                used_pages.fetch_add(1, std::memory_order_relaxed);
+                
+                uintptr_t offset = ((idx * 64) + first_free_bit) * PAGE_SIZE;
+                return reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(arena_base) + offset);
+            }
+            // If compare_exchange_weak failed, another thread stole some bits! 
+            // loop again
         }
     }
     return nullptr;
@@ -92,14 +91,16 @@ void Arena::free_a_page(void *raw_page_base){
     unsigned int idx = page_id / 64;
     unsigned int free_bit = page_id % 64;
 
-    bitmap_mutex.lock();
-    bitmap[idx] &= ~(1ULL << free_bit);
-    bitmap_mutex.unlock();
+    bitmap[idx].fetch_and(~(1ULL << free_bit), std::memory_order_release);
+    used_pages.fetch_sub(1, std::memory_order_release);
 
-    used_pages.fetch_sub(1);
-    // remove_from_lru(raw_page_base);
-
-    if(idx < last_searched_idx){ last_searched_idx = idx; } 
+    size_t current_hint = last_searched_idx.load(std::memory_order_relaxed);
+    // CAS loop to safely pull the hint downwards
+    while (idx < current_hint){
+        if (last_searched_idx.compare_exchange_weak(current_hint, idx, std::memory_order_relaxed)) {
+            break;
+        }
+    }
     return;
 }
 
@@ -115,6 +116,7 @@ void Arena::add_to_lru(void* page_base){
     Page* page = reinterpret_cast<Page*>(page_base);
     std::lock_guard<std::mutex> lock(lru_mutex);
 
+    // Sanity check: page belonga to LRU won't be remove. Keep LRU metadata safe
     if (page->header.lru_next != nullptr || 
         page->header.lru_prev != nullptr || lru_head == page) {
         return; // Already in list
@@ -132,6 +134,11 @@ void Arena::add_to_lru(void* page_base){
 void Arena::remove_from_lru(void* page_base){
     Page* page = reinterpret_cast<Page*>(page_base);
     std::lock_guard<std::mutex> lock(lru_mutex);
+
+    // Sanity check: page don't belong to LRU won't be remove. Keep LRU metadata safe
+    if(page->header.lru_next == nullptr && page->header.lru_prev == nullptr && lru_head != page){
+        return;
+    }
 
     if (page->header.lru_prev) {
         page->header.lru_prev->header.lru_next = page->header.lru_next;
@@ -159,67 +166,5 @@ void Arena::lift_in_lru(void* page_base){
 void* Arena::get_lru_tail(){
     std::lock_guard<std::mutex> lock(lru_mutex);
     return reinterpret_cast<void*>(lru_tail); 
-}
-
-
-/*-------------------------Helper functions---------------------------------------*/
-/* They are not bind to a size class(not a member funtion) for flexibilty reasons */
-
-// TODO: lock free or not? Does user need to hold lock when calling this function?
-// (this is a write to page, a write need a lock)
-// false positive acceptive?
-void mark_slot_hot(void* slot_addr){
-    Page* page = get_struct_page(slot_addr);
-    uint16_t slot_id = page->get_slot_id_nocheck(slot_addr);
-
-    size_t arr_idx = slot_id / 64;
-    size_t bit_idx = slot_id % 64;
-
-    page->is_hot[arr_idx].fetch_or(1ULL << bit_idx, std::memory_order_relaxed);
-};
-
-// TODO: lock free or not? Does user need to hold lock when calling this function?
-// (this is a write to page, a write need a lock)
-void mark_slot_cold(void* slot_addr){
-    Page* page = get_struct_page(slot_addr);
-    uint16_t slot_id = page->get_slot_id_nocheck(slot_addr);
-
-    size_t arr_idx = slot_id / 64;
-    size_t bit_idx = slot_id % 64;
-
-    page->is_hot[arr_idx].fetch_and(~(1ULL << bit_idx), std::memory_order_relaxed);
-};
-
-bool is_slot_hot(void* slot_addr){
-    Page* page = get_struct_page(slot_addr);
-    uint16_t slot_id = page->get_slot_id_nocheck(slot_addr);
-
-    size_t arr_idx = slot_id / 64;
-    size_t bit_idx = slot_id % 64;
-
-    return page->is_hot[arr_idx].load(std::memory_order_relaxed) & (1ULL << bit_idx);
-}
-
-uint16_t get_page_hot_count(Page* page) {
-    uint16_t total_hot = 0;
-    for (int i = 0; i < IS_HOT_ARR_LENGTH; i++) {
-        // no lock. 'slightly false' value is acceptable
-        uint64_t chunk = page->is_hot[i].load(std::memory_order_relaxed);
-        total_hot += __builtin_popcountll(chunk);
-    }
-    return total_hot;
-}
-
-void clear_page_hot_bits(Page* page) {
-    for (int i = 0; i < 4; i++) {
-        page->is_hot[i].store(0ULL, std::memory_order_relaxed);
-    }
-}
-
-Page* get_struct_page(void* slot_addr){
-    uintptr_t slot_addr_ = reinterpret_cast<uintptr_t>(slot_addr);
-    uintptr_t page_base = PAGE_ALIGN(slot_addr_);
-
-    return reinterpret_cast<Page*>(page_base);
 }
 }//namesapce imdb
