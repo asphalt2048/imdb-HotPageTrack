@@ -217,51 +217,139 @@ void SizeClassManager::unquarantine_page(Page* page){
 
 // TODO: lock free or not? Does user need to hold lock when calling this function?
 // (this is a write to page, a write need a lock)
-// false positive acceptive?
-void mark_slot_hot(void* slot_addr){
+// false positive acceptable?
+void promote_a_slot(void* slot_addr, uint8_t inc){
     Page* page = get_struct_page(slot_addr);
     uint16_t slot_id = page->get_slot_idx_nocheck(slot_addr);
 
-    size_t arr_idx = slot_id / 64;
-    size_t bit_idx = slot_id % 64;
+    size_t arr_idx = slot_id / 32;
+    size_t bit_idx = slot_id % 32;
+    size_t bit_shift = bit_idx*2;
 
-    page->is_hot[arr_idx].fetch_or(1ULL << bit_idx, std::memory_order_relaxed);
+    // use CAS loop to update is_hot
+    uint64_t old_arr = page->is_hot[arr_idx].load(std::memory_order_relaxed);
+    while(true){
+        uint64_t current_val = (old_arr>>bit_shift) & 0b11ULL;
+        // already reached the max hotness, do nothing
+        if(current_val == 3) break;
+
+        uint64_t new_val = current_val + inc;
+        if(new_val > 3) new_val = 3;
+
+        uint64_t new_arr = (old_arr & ~(0b11ULL<<bit_shift)) | (new_val << bit_shift);
+        if(page->is_hot[arr_idx].compare_exchange_weak(old_arr, new_arr, std::memory_order_relaxed)){
+            break;
+        }
+    }
 };
 
-// TODO: lock free or not? Does user need to hold lock when calling this function?
-// (this is a write to page, a write need a lock)
+
+void age_a_slot(void* slot_addr){
+    Page* page = get_struct_page(slot_addr);
+    uint16_t slot_id = page->get_slot_idx_nocheck(slot_addr);
+
+    size_t arr_idx = slot_id / 32;
+    size_t bit_idx = slot_id % 32;
+    size_t bit_shift = bit_idx*2;
+
+    // use CAS loop to update is_hot
+    uint64_t old_arr = page->is_hot[arr_idx].load(std::memory_order_relaxed);
+    while(true){
+        uint64_t current_val = (old_arr>>bit_shift) & 0b11ULL;
+        // already reached the min hotness, do nothing
+        if(current_val == 0) break;
+
+        uint64_t new_val = current_val - 1;
+        uint64_t new_arr = (old_arr & ~(0b11ULL<<bit_shift)) | (new_val << bit_shift);
+
+        if(page->is_hot[arr_idx].compare_exchange_weak(old_arr, new_arr, std::memory_order_relaxed)){
+            break;
+        }
+    }
+}
+
 void mark_slot_cold(void* slot_addr){
     Page* page = get_struct_page(slot_addr);
     uint16_t slot_id = page->get_slot_idx_nocheck(slot_addr);
 
-    size_t arr_idx = slot_id / 64;
-    size_t bit_idx = slot_id % 64;
+    size_t arr_idx = slot_id / 32;
+    size_t bit_idx = slot_id % 32;
+    size_t bit_shift = bit_idx*2;
 
-    page->is_hot[arr_idx].fetch_and(~(1ULL << bit_idx), std::memory_order_relaxed);
+    page->is_hot[arr_idx].fetch_and(~(0b11ULL<<bit_shift), std::memory_order_relaxed);
 };
 
-bool is_slot_hot(void* slot_addr){
+uint8_t get_slot_hotness(void* slot_addr){
     Page* page = get_struct_page(slot_addr);
     uint16_t slot_id = page->get_slot_idx_nocheck(slot_addr);
 
-    size_t arr_idx = slot_id / 64;
-    size_t bit_idx = slot_id % 64;
+    size_t arr_idx = slot_id / 32;
+    size_t bit_idx = slot_id % 32;
+    size_t bit_shift = bit_idx * 2;
 
-    return page->is_hot[arr_idx].load(std::memory_order_relaxed) & (1ULL << bit_idx);
+    uint64_t chunk = page->is_hot[arr_idx].load(std::memory_order_relaxed);
+    uint8_t val = (chunk>>bit_shift) & 0b11ULL;
+    return val;
+}
+
+// Explicitly set the 2-bit hotness value safely
+void set_slot_hotness(void* slot_addr, uint8_t exact_val){
+    Page* page = get_struct_page(slot_addr);
+    uint16_t slot_id = page->get_slot_idx_nocheck(slot_addr);
+
+    size_t arr_idx = slot_id / 32;
+    size_t bit_shift = (slot_id % 32) * 2;
+
+    uint64_t old_arr = page->is_hot[arr_idx].load(std::memory_order_relaxed);
+    while (true){
+        uint64_t new_arr = (old_arr & ~(0b11ULL << bit_shift)) | (static_cast<uint64_t>(exact_val) << bit_shift);
+        if (page->is_hot[arr_idx].compare_exchange_weak(old_arr, new_arr, std::memory_order_relaxed)) {
+            break;
+        }
+    }
 }
 
 uint16_t get_page_hot_count(Page* page) {
     uint16_t total_hot = 0;
+    // no lock. 'false' value is acceptable
     for (int i = 0; i < IS_HOT_ARR_LENGTH; i++) {
-        // no lock. 'slightly false' value is acceptable
         uint64_t chunk = page->is_hot[i].load(std::memory_order_relaxed);
-        total_hot += __builtin_popcountll(chunk);
+        for(size_t bit_shift=0; bit_shift<64; bit_shift+=2){
+            total_hot += ((chunk>>bit_shift) & 0b11ULL);
+        }
+    }
+    return total_hot;
+}
+
+uint16_t age_and_get_page_hot_count(Page* page){
+    uint16_t total_hot = 0;
+    
+    for(int i=0; i < IS_HOT_ARR_LENGTH; i++){
+        uint64_t old_arr = page->is_hot[i].load(std::memory_order_relaxed);
+        
+        while(true){
+            uint64_t new_arr = 0ULL;
+            uint16_t chunk_hot = 0; // Temp counter for this specific CAS attempt
+            
+            for(size_t bit_shift=0; bit_shift<64; bit_shift+=2){
+                uint8_t val = (old_arr>>bit_shift) & 0b11ULL;
+                chunk_hot += val; // Count the hotness
+                
+                if(val > 0) val--; // Age the record
+                new_arr |= (static_cast<uint64_t>(val) << bit_shift); // Safely pack it
+            }
+            
+            if(page->is_hot[i].compare_exchange_weak(old_arr, new_arr, std::memory_order_relaxed)){
+                total_hot += chunk_hot; 
+                break;
+            }
+        }
     }
     return total_hot;
 }
 
 void clear_page_hot_bits(Page* page) {
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < IS_HOT_ARR_LENGTH; i++) {
         page->is_hot[i].store(0ULL, std::memory_order_relaxed);
     }
 }

@@ -16,7 +16,7 @@
 #define RED     "\033[31m"  /* text color: red */
 #define RESET   "\033[0m"   /* reset color */ 
 #define PAGE_ALIGN(x) ((x) & ~(4096ULL - 1))
-#define IS_HOT_ARR_LENGTH 4
+#define IS_HOT_ARR_LENGTH 8
 #define IS_ALLOCATED_ARR_LENGHT 4
 
 /* The manager of arena.
@@ -24,6 +24,8 @@
  */
 
 namespace imdb{ 
+// TODO: define Page in this header?
+
 struct Page{
     static constexpr size_t PAGE_SIZE = 4096;
 
@@ -42,12 +44,12 @@ struct Page{
         uint16_t max_slots; // dynamically set by SizeClassManager::init_page()
         std::atomic<uint16_t> used;    // counter of in-use slots
 
-        /* The size header takes. Calculated dynamically at init_page() */
+        /* The size that header takes. Calculated dynamically at init_page() */
         uint16_t header_reserved;
     }header;
 
-    /* array that tracks records usage. Recently accessed record should have is_hot bit == 1.
-     * Record header is 8 bytes, so SC begins with 16 bytes. Making a page containing at most 254 records.
+    /* array that tracks records usage. use two bits to measures a record's hotness. 
+     * TODO: Record header is 8 bytes, so SC begins with 16 bytes. Making a page containing at most 254 records.
      */
     std::atomic<uint64_t> is_hot[IS_HOT_ARR_LENGTH];
     /* TODO: added this just to prevent a deadlock bug. See StorageEngine.cpp: page_hot_rescue. Free slot bug */

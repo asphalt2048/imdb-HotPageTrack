@@ -68,16 +68,23 @@ class SizeClassManager{
         void unquarantine_page(Page* page);
 };
 
-/* helper function. The functions are not a member of SCM for flexibilty reasons */
-void mark_slot_hot(void* slot_addr);
+/* helper function. Used for is_hot array */
+void promote_a_slot(void* slot_addr, uint8_t inc = 1);
+void age_a_slot(void* slot_addr);
 void mark_slot_cold(void* slot_addr);
-bool is_slot_hot(void* slot_addr);
-// return the total hot slot count
+uint8_t get_slot_hotness(void* slot_addr);
+void set_slot_hotness(void* slot_addr, uint8_t exact_val);
+// return the total is_hot count
 uint16_t get_page_hot_count(Page* page);
+// also do '-1' on is_hot
+uint16_t age_and_get_page_hot_count(Page* page);
 // clear is_hot
 void clear_page_hot_bits(Page* page);
+
 /* helper function. Input: addr of a slot. Output: struct page the slot belonging to */
 Page* get_struct_page(void* slot_addr);
+
+/* helper function. Used for is_allocated bit map */
 /* set the is_allocated bit */
 void set_allocated_bit(Page* page, uint16_t slot_idx);
 /* clear is_allcated bit */

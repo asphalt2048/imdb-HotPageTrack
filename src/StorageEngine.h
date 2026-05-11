@@ -12,7 +12,8 @@
 #include "ShardedHashmap.h"
 
 namespace imdb{
-#define PAGE_HOT_SCALE 4  
+#define PAGE_HOT_SCALE 1
+#define SLOT_HOT_THRESHOLD 2
 #define TABLE_END  0XFFFFFFFFFFFFFFFF
 
 // TODO: will the FIFO feature of TT makes this inefficient?

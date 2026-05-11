@@ -40,6 +40,10 @@ void StorageEngine::remove_from_table(uint64_t logical_id){
     std::unique_lock<std::shared_mutex> write_lock(tt_meta_rw_lock);
 
     translation_table[logical_id].next_free_idx = next_logical_id;
+
+    // don't remove this line, unless the partial in-use slot problem
+    // (noted in page_hot_rescue), is solved perfectly.
+    translation_table[logical_id].in_use.is_in_ram = false;
     next_logical_id = logical_id;
 }
 
@@ -118,14 +122,14 @@ bool StorageEngine::update_record(const std::string &key, uint64_t logical_id, c
         if( real_size <= old_size){
             scm.free(pre_alloc_slot);
             fill_slot_nocheck(slot_addr, logical_id, record, record_size);
-            mark_slot_hot(slot_addr);
+            promote_a_slot(slot_addr);
             loc.in_use.size = record_size;
             return true;
         }
         /* case 1.2: New data outgrows the current slot. Reallocate. */
         else{
             fill_slot_nocheck(pre_alloc_slot, logical_id, record, record_size);
-            mark_slot_hot(pre_alloc_slot);
+            promote_a_slot(pre_alloc_slot);
 
             SizeClassManager &old_scm = SCMs[get_scm_index(old_size)];
             old_scm.free(slot_addr);
@@ -139,7 +143,7 @@ bool StorageEngine::update_record(const std::string &key, uint64_t logical_id, c
     /* case 2: record is in disk */
     else{
         fill_slot_nocheck(pre_alloc_slot, logical_id, record, record_size);
-        mark_slot_hot(pre_alloc_slot);
+        promote_a_slot(pre_alloc_slot);
 
         loc.in_use.is_in_ram = true;
         loc.in_use.ram_addr = pre_alloc_slot;
@@ -153,10 +157,8 @@ bool StorageEngine::insert_record(const std::string& key, const char* record, ui
     void* new_slot_addr = scm.alloc();
 
     RecordLoc new_loc;
-    new_loc.in_use.is_in_ram = true;
-    new_loc.in_use.size = record_size;
-    new_loc.in_use.ram_addr = new_slot_addr;
 
+    promote_a_slot(new_slot_addr);
     uint64_t new_logical_id = add_to_table(new_loc);
     fill_slot_nocheck(new_slot_addr, new_logical_id, record, record_size);
     
@@ -169,8 +171,11 @@ bool StorageEngine::insert_record(const std::string& key, const char* record, ui
         remove_from_table(new_logical_id);
         return false;
     }
-       
-    mark_slot_hot(new_slot_addr);
+
+    /* must update TT at the end. */
+    new_loc.in_use.is_in_ram = true;
+    new_loc.in_use.size = record_size;
+    new_loc.in_use.ram_addr = new_slot_addr;
 
     return true;
 }
@@ -243,7 +248,7 @@ bool StorageEngine::get(const std::string& key, char* buf, uint64_t& out_record_
 
         std::memcpy(buf, payload, loc.in_use.size);
         out_record_size = loc.in_use.size;
-        mark_slot_hot(loc.in_use.ram_addr);
+        promote_a_slot(loc.in_use.ram_addr);
 
         return true;
     }
@@ -268,7 +273,7 @@ bool StorageEngine::get(const std::string& key, char* buf, uint64_t& out_record_
         RecordHeader* header = reinterpret_cast<RecordHeader*>(loc.in_use.ram_addr);
         std::memcpy(buf, header->get_payload(), loc.in_use.size);
         out_record_size = loc.in_use.size;
-        mark_slot_hot(loc.in_use.ram_addr);
+        promote_a_slot(loc.in_use.ram_addr);
         
         scm.free(pre_alloc_slot); 
         return true; 
@@ -283,7 +288,7 @@ bool StorageEngine::get(const std::string& key, char* buf, uint64_t& out_record_
     out_record_size = loc.in_use.size;
 
     fill_slot_nocheck(pre_alloc_slot, logical_id, buf, loc.in_use.size);
-    mark_slot_hot(pre_alloc_slot);
+    promote_a_slot(pre_alloc_slot);
 
     loc.in_use.is_in_ram = true;
     loc.in_use.ram_addr = pre_alloc_slot;
@@ -358,7 +363,6 @@ void StorageEngine::page_hot_rescue(Page* victim_page, bool &page_fully_cleared)
         uint16_t slot_idx = victim_page->get_slot_idx_nocheck(slot_addr);
 
         /* skip the slot if it's definitely free.
-         * 
          */
         if(!get_allocated_bit(victim_page, slot_idx)){ continue; }
 
@@ -393,19 +397,20 @@ void StorageEngine::page_hot_rescue(Page* victim_page, bool &page_fully_cleared)
                 // It's a fully in-use slot!
 
                 size_t total_size = loc.in_use.size + sizeof(RecordHeader);
+                uint8_t hotness = get_slot_hotness(slot_addr);
                 // --- BEST EFFORT RESCUE ---
-                if (config.enable_hot_rescue && is_slot_hot(slot_addr)) {
+                if (config.enable_hot_rescue && hotness >= SLOT_HOT_THRESHOLD){
                     /* TRY to ask free space in SCM. Might fail. 
                      * If fail, let the record die(write to disk).
                      *
                      * WARNING: allocation in this section must not sleep!
                      */
-                    void* new_slot = scm.alloc_notrigger();
+                    void* new_slot_addr = scm.alloc_notrigger();
                     
-                    if (new_slot != nullptr) {
-                        std::memcpy(new_slot, slot_addr, total_size);
-                        loc.in_use.ram_addr = new_slot;
-                        mark_slot_cold(new_slot); 
+                    if (new_slot_addr != nullptr) {
+                        std::memcpy(new_slot_addr, slot_addr, total_size);
+                        loc.in_use.ram_addr = new_slot_addr;
+                        set_slot_hotness(new_slot_addr, hotness);
 
                         clear_allocated_bit(victim_page, slot_idx);
                         victim_page->header.used.fetch_sub(1);
@@ -446,9 +451,8 @@ void StorageEngine::evict_cold_page() {
          * If a page have (hot records > max_slot/PAGE_HOT_SCALE), give it a second chance.
          * the page is lifted to the head of lru. And all hot bits are cleared
           ======================================================================= */
-        uint16_t hot_count = get_page_hot_count(victim_page);
-        if (hot_count > (max_slots / PAGE_HOT_SCALE)) {
-            clear_page_hot_bits(victim_page);
+        uint16_t hot_count = age_and_get_page_hot_count(victim_page);
+        if (hot_count > (max_slots / PAGE_HOT_SCALE)){
             arena.lift_in_lru(victim_page);
             continue; 
         }
@@ -461,6 +465,10 @@ void StorageEngine::evict_cold_page() {
         if(page_fully_cleared){
             arena.remove_from_lru(reinterpret_cast<void*>(victim_page));
             arena.free_a_page(reinterpret_cast<void*>(victim_page));
+        }else{
+            // not fully evicted. Lfit in LRU as "try again later"
+            // TODO: might want something like 'lift to the middle', but not to the head
+            arena.lift_in_lru(victim_page);
         }
 
         if(arena.is_safe()){
