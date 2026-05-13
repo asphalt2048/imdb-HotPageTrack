@@ -32,20 +32,20 @@ all: benchmark
 benchmark: 
 	@echo "Compiling Benchmark (RELEASE MODE: -O3 -DNDEBUG)..."
 	$(CXX) $(CXXFLAGS) $(RELEASE_FLAGS) $(CORE_SRCS) $(TEST_DIR)/benchmark.cpp -o build/db_bench
-	@echo "Done! Ferrari ready. Run with: ./db_bench"
+	@echo "Done! Ferrari ready. Run with: ./build/db_bench"
 
 # 2. Debug Build (For GDB and testing)
 debug:
 	@echo "Compiling Benchmark (DEBUG MODE: -g -O0)..."
 	$(CXX) $(CXXFLAGS) $(DEBUG_FLAGS) $(CORE_SRCS) $(TEST_DIR)/benchmark.cpp -o build/db_bench_debug
-	@echo "Done! Run with: ./db_bench_debug"
+	@echo "Done! Run with: ./build/db_bench_debug"
 
 # 3. Old Correctness Test (Example)
 # (Assuming you have a file named test/correctness_test.cpp)
 test:
 	@echo "Compiling Correctness Test (DEBUG MODE)..."
 	$(CXX) $(CXXFLAGS) $(DEBUG_FLAGS) $(CORE_SRCS) $(TEST_DIR)/basic_test.cpp -o build/db_test
-	@echo "Done! Run with: ./db_test"
+	@echo "Done! Run with: ./build/db_test"
 
 # ==========================================
 # Cleanup
