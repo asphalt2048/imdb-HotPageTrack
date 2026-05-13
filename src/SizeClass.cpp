@@ -1,17 +1,13 @@
 #include "SizeClass.h"
 
-// operations is current protected by and only by db-global lock. 
-// ======================================================================================
-
 namespace imdb{
 void SizeClassManager::push_to_partial_list(Page *page){
-    if (page->header.next != nullptr || 
-        page->header.prev != nullptr || partial_list_head == page) {
-        return; // Already in list
-    }
-    if(page->header.used.load() == page->header.max_slots){
-        return; // it's a full page
-    }
+    assert( !(page->header.next != nullptr || 
+        page->header.prev != nullptr || partial_list_head == page) &&
+        "FATAL: Tried to push linked page!");
+
+    assert( !(page->header.used.load() == page->header.max_slots) &&
+        "FATAL: Tried to push full page!");
 
     page->header.prev = nullptr;
     page->header.next = partial_list_head;
@@ -21,9 +17,9 @@ void SizeClassManager::push_to_partial_list(Page *page){
 }
 
 void SizeClassManager::remove_from_partial_list(Page *page){
-    if(page->header.next == nullptr && page->header.prev == nullptr && partial_list_head != page){
-        return; // not in list
-    }
+    assert( !(page->header.next == nullptr && 
+        page->header.prev == nullptr && partial_list_head != page) && 
+        "FATAL: Tried to remove unlinked page!");
 
     if (page->header.prev){
         page->header.prev->header.next = page->header.next;
@@ -59,7 +55,8 @@ void SizeClassManager::return_a_page(Page* page){
 /* init a page with the correct format, setup interal free slots list */
 Page* SizeClassManager::init_page(void* raw_page_base){
     Page* page = reinterpret_cast<Page*>(raw_page_base);
-    page->header.used = 0;
+    page->header.used.store(0, std::memory_order_relaxed);
+    page->header.is_quarantined.store(false, std::memory_order_relaxed);
     page->header.next = nullptr;
     page->header.prev = nullptr;
     page->header.lru_prev = nullptr;
@@ -132,8 +129,9 @@ void* SizeClassManager::alloc(){
     }
 
     write_lock.unlock(); 
-    // TODO: get page might sleep, and sweeper might need this lock. 
+    // get page might sleep, drop the lock in case sweeper need it
     Page* new_page = get_a_page();
+    // TODO: heavy load on a single SC will cause it to ask many pages at once.
     write_lock.lock();
 
     uint16_t slot_idx = get_free_slot(new_page);
@@ -186,12 +184,16 @@ void SizeClassManager::free(void* slot_addr){
     clear_allocated_bit(page, slot_idx);
     uint16_t old_used = page->header.used.fetch_sub(1);
 
+    // do updates on page's pointers if sweeper isn't quarantining it
+    if (page->header.is_quarantined.load(std::memory_order_acquire)) {
+        return; 
+    }
+
     if(old_used == page->header.max_slots){
         push_to_partial_list(page);
     }
 
     if(old_used == 1){
-        // TODO: race condition with sweeper
         remove_from_partial_list(page);
         return_a_page(page);
     }
@@ -199,16 +201,50 @@ void SizeClassManager::free(void* slot_addr){
     return;
 }
 
-void SizeClassManager::quarantine_page(Page* page){
+bool SizeClassManager::quarantine_page(Page* page){
     std::unique_lock<std::shared_mutex> write_lock(rw_lock);
 
-    remove_from_partial_list(page);
+    if(page->header.used.load(std::memory_order_relaxed) == 0){
+        return false;
+    }
+    if(page->header.slot_size != slot_size){
+        return false;
+    }
+
+    if(page->header.used.load(std::memory_order_relaxed) < page->header.max_slots){
+        remove_from_partial_list(page);
+    }
+    page->header.is_quarantined.store(true, std::memory_order_release);
+    return true;
 }
 
-void SizeClassManager::unquarantine_page(Page* page){
+Status SizeClassManager::unquarantine_page(Page* page){
     std::unique_lock<std::shared_mutex> write_lock(rw_lock);
 
-    push_to_partial_list(page);
+    uint16_t current_used = page->header.used.load(std::memory_order_relaxed);
+    
+    // Page not fully cleared. But is a partial page
+    if(current_used > 0 && current_used < page->header.max_slots){
+        push_to_partial_list(page);
+        arena.lift_in_lru(reinterpret_cast<void*>(page));
+        page->header.is_quarantined.store(false, std::memory_order_release);
+        return PARTIAL_PAGE_EVICTED;
+    }
+    // Page not fully cleared, and is still full after eviciton loop. Unlikely to happen
+    if(current_used == page->header.max_slots){
+        arena.lift_in_lru(reinterpret_cast<void*>(page));
+        page->header.is_quarantined.store(false, std::memory_order_release);
+        return PARTIAL_PAGE_EVICTED;
+    }
+    // Page fully cleared.
+    if(current_used == 0){
+        
+        page->header.is_quarantined.store(false, std::memory_order_release);
+        arena.remove_from_lru(reinterpret_cast<void*>(page));
+        arena.free_a_page(reinterpret_cast<void*>(page));
+        return FULL_PAGE_EVICTED;
+    }
+    return ERROR;
 }
 
 

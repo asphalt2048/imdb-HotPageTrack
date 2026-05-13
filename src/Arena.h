@@ -12,6 +12,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <thread>
+#include <assert.h>
 
 #define RED     "\033[31m"  /* text color: red */
 #define RESET   "\033[0m"   /* reset color */ 
@@ -43,6 +44,7 @@ struct Page{
         uint16_t slot_size;
         uint16_t max_slots; // dynamically set by SizeClassManager::init_page()
         std::atomic<uint16_t> used;    // counter of in-use slots
+        std::atomic<bool> is_quarantined;
 
         /* The size that header takes. Calculated dynamically at init_page() */
         uint16_t header_reserved;
@@ -68,16 +70,15 @@ struct Page{
 
 class Arena{
     private:
-        static constexpr size_t ARENA_SIZE = 1024*1024*8;
         static constexpr size_t PAGE_SIZE = 4096;
-        static constexpr size_t TOTAL_PAGES = ARENA_SIZE / PAGE_SIZE;
-        /* devided by 64 as bitmap is defined as uint64_t 
-         * ARENA_SIZE must be multiple of 64 pages or this will fail
-         */
-        static constexpr size_t BITMAP_SIZE = TOTAL_PAGES / 64;
-        static_assert(TOTAL_PAGES % 64 == 0, "Arena size must be a multiple of 64 pages");
 
-        std::atomic<uint64_t> bitmap[BITMAP_SIZE];
+        /* --- DYNAMIC SIZING --- */
+        size_t arena_size;
+        size_t total_pages;
+        size_t bitmap_size;
+
+        /* Dynamically allocated array of atomics */
+        std::unique_ptr<std::atomic<uint64_t>[]> bitmap;
 
         /* The beginning address of arena */
         void *arena_base;
@@ -97,7 +98,7 @@ class Arena{
         Page* lru_tail{nullptr};
         
     public:
-        Arena();
+        Arena(size_t size_in_bytes);
         ~Arena();
 
         std::mutex sweeper_mutex;

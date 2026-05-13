@@ -18,6 +18,12 @@
 #define SLOT_END 0XFFFF
 
 namespace imdb{
+enum Status{
+    FULL_PAGE_EVICTED,
+    PARTIAL_PAGE_EVICTED,
+    ERROR
+};
+
 /* Manager of one kind of size class, allocates and frees slots 
  */
 class SizeClassManager{
@@ -62,15 +68,18 @@ class SizeClassManager{
         void free(void* raw_addr);
         /* allocate a slot if SCM have free space, never ask new page. Might fail */
         void* alloc_notrigger();
-        /* same as remove_from_partial_list, used by sweeper thread to isolate page */
-        void quarantine_page(Page* page);
-        /* same as push_to_partial_list, used by sweeper to return a not fully cleared page */
-        void unquarantine_page(Page* page);
+        /* used by sweeper thread to isolate page */
+        bool quarantine_page(Page* page);
+        /* used by sweeper to unisolate page */
+        Status unquarantine_page(Page* page);
 };
 
 /* helper function. Used for is_hot array */
+// increase is_hot to make a slot have lower chance to be swapped out
 void promote_a_slot(void* slot_addr, uint8_t inc = 1);
+// decrease is_hot to make a slot have higher chance to be swapped out
 void age_a_slot(void* slot_addr);
+// mark is_hot as zero. 
 void mark_slot_cold(void* slot_addr);
 uint8_t get_slot_hotness(void* slot_addr);
 void set_slot_hotness(void* slot_addr, uint8_t exact_val);

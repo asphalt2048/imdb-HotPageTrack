@@ -15,6 +15,11 @@ all:
 	$(CXX) $(CXXFLAGS) *.cpp -o $(TARGET)
 	@echo "Done!"
 
+test:
+	@echo "Compiling all files into $(TARGET)..."
+	$(CXX) $(CXXFLAGS) *.cpp -o $(TARGET)
+
 # Rule to clean up the executable when you type 'make clean'
 clean:
 	rm -f $(TARGET)
+	rm -f ../data/imdb.aof

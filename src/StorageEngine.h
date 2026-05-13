@@ -61,7 +61,7 @@ struct RecordHeader{
 struct DBConfig{
     std::string db_file_path = "../data/imdb.aof";
     uint8_t table_grow_speed = 2;
-
+    size_t arena_size = 1024 * 1024 * 512; // default 512MB
     bool enable_hot_rescue = 1;
 };
 
@@ -70,7 +70,6 @@ struct DBConfig{
  */
 class StorageEngine{
     private:
-
         DBConfig config;
         Arena arena;
         DiskManager disk_manager;
@@ -96,7 +95,7 @@ class StorageEngine{
 
         void evict_cold_page();
         /* rescue hot record, and write other records to disk.*/
-        void page_hot_rescue(Page* victim_page, bool &page_fully_cleared);
+        void page_hot_rescue(Page* victim_page);
 
         /* --------------- helper functions -------------------------- */
 
@@ -122,6 +121,12 @@ class StorageEngine{
         void grow_table();
 
     public:
+        // debug:
+        std::atomic<uint64_t> hot_rescued_count{0};
+        std::atomic<uint64_t> whole_page_evicted_count{0};
+        std::atomic<uint64_t> partial_page_evicted_count{0};
+        bool is_arena_critical() const { return arena.is_critical(); }
+
         StorageEngine(const DBConfig &cfg = DBConfig());
 
         ~StorageEngine() = default;

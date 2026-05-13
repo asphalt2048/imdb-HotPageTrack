@@ -1,43 +1,55 @@
 #include "Arena.h"
 
 namespace imdb{
-Arena::Arena(){
-    arena_base = mmap(nullptr, ARENA_SIZE, PROT_READ|PROT_WRITE, MAP_ANONYMOUS|MAP_PRIVATE, -1, 0);
-    if(arena_base == MAP_FAILED){
-        std::cerr << RED << "mmap failed, arena setup existing\n"<<RESET;
+Arena::Arena(size_t size_in_bytes) : 
+    arena_size(size_in_bytes),
+    total_pages(size_in_bytes / PAGE_SIZE),
+    bitmap_size(total_pages / 64)
+{
+    // Runtime check replacing the old static_assert
+    if (total_pages % 64 != 0) {
+        std::cerr<<RED<<"Arena size must be a multiple of "<<(PAGE_SIZE * 64)<<" bytes\n"<<RESET;
         exit(-1);
     }
-    /* Pin down arena in memory. We don't want OS to swap our page, we do it ourselves */
-    if(mlock(arena_base, ARENA_SIZE) != 0){
+
+    arena_base = mmap(nullptr, arena_size, PROT_READ|PROT_WRITE, MAP_ANONYMOUS|MAP_PRIVATE, -1, 0);
+    if(arena_base == MAP_FAILED){
+        std::cerr<<RED<<"mmap failed, arena setup exiting\n"<<RESET;
+        exit(-1);
+    }
+    
+    if(mlock(arena_base, arena_size) != 0){
         std::cerr<<RED<<"Failed to mlock arena\n"<<RESET;
         exit(-1);
     }
 
-    /* init bitmap */
-    for(size_t i = 0; i<BITMAP_SIZE; i++){ bitmap[i] = 0; }
+    /* Initialize dynamic bitmap */
+    bitmap = std::make_unique<std::atomic<uint64_t>[]>(bitmap_size);
+    for(size_t i = 0; i < bitmap_size; i++){ 
+        bitmap[i].store(0, std::memory_order_relaxed); 
+    }
+    
     last_searched_idx = 0;
 
-    high_watermark = TOTAL_PAGES*0.80;
-    low_watermark = TOTAL_PAGES*0.90;
-    min_watermark = TOTAL_PAGES*0.98;
+    high_watermark = total_pages * 0.80;
+    low_watermark = total_pages * 0.90;
+    min_watermark = total_pages * 0.98;
 }
 
-Arena::~Arena(){ munmap(arena_base, ARENA_SIZE); }
+Arena::~Arena(){ munmap(arena_base, arena_size); }
 
 void* Arena::alloc_a_page_nocheck(){
     size_t local_start = last_searched_idx.load(std::memory_order_relaxed);
 
-    for (size_t i = 0; i < BITMAP_SIZE; i++) {
-        size_t idx = (local_start + i) % BITMAP_SIZE;
+    for (size_t i = 0; i < bitmap_size; i++) {
+        size_t idx = (local_start + i) % bitmap_size;
         
         uint64_t chunk = bitmap[idx].load(std::memory_order_acquire);
         
-        // Spin lock-free on this specific chunk until we claim a bit or it fills up
         while (chunk != ~0ULL) {
             int first_free_bit = __builtin_ctzll(~chunk);
             uint64_t new_chunk = chunk | (1ULL << first_free_bit);
             
-            // Try to atomically swap our modified chunk into the array
             if (bitmap[idx].compare_exchange_weak(chunk, new_chunk, std::memory_order_release, std::memory_order_relaxed)){
                 
                 last_searched_idx.store(idx, std::memory_order_relaxed);
@@ -46,8 +58,6 @@ void* Arena::alloc_a_page_nocheck(){
                 uintptr_t offset = ((idx * 64) + first_free_bit) * PAGE_SIZE;
                 return reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(arena_base) + offset);
             }
-            // If compare_exchange_weak failed, another thread stole some bits! 
-            // loop again
         }
     }
     return nullptr;
@@ -81,7 +91,7 @@ void Arena::free_a_page(void *raw_page_base){
     uintptr_t arena_base_ = reinterpret_cast<uintptr_t>(arena_base);
     uintptr_t page_base = reinterpret_cast<uintptr_t>(raw_page_base);
 
-    if(page_base<arena_base_ || page_base>=arena_base_ + ARENA_SIZE){
+    if(page_base < arena_base_ || page_base >= arena_base_ + arena_size){
         std::cerr<<RED<<"err: Arena::free_a_page(), page not belongs to arena\n"<<RESET;
         exit(-1);
     }
@@ -95,7 +105,6 @@ void Arena::free_a_page(void *raw_page_base){
     used_pages.fetch_sub(1, std::memory_order_release);
 
     size_t current_hint = last_searched_idx.load(std::memory_order_relaxed);
-    // CAS loop to safely pull the hint downwards
     while (idx < current_hint){
         if (last_searched_idx.compare_exchange_weak(current_hint, idx, std::memory_order_relaxed)) {
             break;
@@ -116,7 +125,7 @@ void Arena::add_to_lru(void* page_base){
     Page* page = reinterpret_cast<Page*>(page_base);
     std::lock_guard<std::mutex> lock(lru_mutex);
 
-    // Sanity check: page belonga to LRU won't be remove. Keep LRU metadata safe
+    // Sanity check: page belong to LRU won't be added. Keep LRU metadata safe
     if (page->header.lru_next != nullptr || 
         page->header.lru_prev != nullptr || lru_head == page) {
         return; // Already in list
