@@ -4,4 +4,4 @@ data/
 
 uffd-demo/
 
-*.exe
+build/
