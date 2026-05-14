@@ -81,13 +81,15 @@ struct BenchConfig {
 
 std::atomic<bool> keep_running{true};
 
-struct ThreadMetrics {
+// Force 64-byte alignment to prevent False Sharing
+struct alignas(64) ThreadMetrics {
     uint64_t total_ops = 0;
     uint64_t successful_reads = 0;
     uint64_t successful_updates = 0;
     uint64_t corruptions = 0;          
     double total_latency_us = 0;
-    double max_latency_us = 0;
+    size_t latency_count = 0;
+    std::vector<double> latencies; 
 };
 
 enum class BenchState { WARMUP, MEASURE, DONE };
@@ -157,10 +159,6 @@ void load_database(StorageEngine& db, BenchConfig& config) {
         
         bool success = db.put(key, payload_buffer, dynamic_size);
         if(!success) dropped_records++;
-        
-        // if (i % (config.num_records / 10) == 0) {
-        //     std::cout << "  ... " << (i * 100) / config.num_records << "% loaded.\n";
-        // }
     }
     if (dropped_records > 0) {
         std::cout << "[WARNING] Arena OOM during load! Dropped " << dropped_records << " records.\n";
@@ -178,6 +176,11 @@ void benchmark_worker(int thread_id, StorageEngine* db, BenchConfig config, Thre
     
     // Worker randomly resizes records on update!
     std::uniform_int_distribution<size_t> size_dist(20, 248); 
+
+    // Use resize() instead of reserve() and fill with 0.0. 
+    // This forces Linux to physically map the pages NOW, not during the benchmark.
+    // 50 million ops per thread handles up to 6.6M ops/sec total for 60s.
+    metrics->latencies.resize(50000000, 0.0);
 
     char update_payload[256];
     char read_buffer[256]; 
@@ -212,7 +215,12 @@ void benchmark_worker(int thread_id, StorageEngine* db, BenchConfig config, Thre
         if (global_bench_state.load(std::memory_order_relaxed) == BenchState::MEASURE) {
             metrics->total_ops++;
             metrics->total_latency_us += latency;
-            if (latency > metrics->max_latency_us) metrics->max_latency_us = latency;
+            
+            // Raw array write: No branch prediction penalties, no VM page faults!
+            if (metrics->latency_count < 50000000) {
+                metrics->latencies[metrics->latency_count++] = latency;
+            }
+            
             if (success) {
                 if (is_read) metrics->successful_reads++;
                 else metrics->successful_updates++;
@@ -300,7 +308,7 @@ int main(int argc, char* argv[]) {
     telemetry_thread.join();
 
     uint64_t total_ops = 0, total_reads = 0, total_updates = 0, total_corruptions = 0;
-    double global_max_latency = 0, total_latency_sum = 0;
+    double total_latency_sum = 0;
 
     for (int i = 0; i < config.num_threads; i++) {
         total_ops += metrics[i].total_ops;
@@ -308,10 +316,33 @@ int main(int argc, char* argv[]) {
         total_updates += metrics[i].successful_updates;
         total_corruptions += metrics[i].corruptions;
         total_latency_sum += metrics[i].total_latency_us;
-        if (metrics[i].max_latency_us > global_max_latency) global_max_latency = metrics[i].max_latency_us;
     }
 
-    std::cout << "\n[Phase 5] Running validation sweep...\n";
+    // --- LATENCY PERCENTILE CALCULATION ---
+    std::cout << "\n[Phase 5] Sorting " << total_ops << " latency records... (This may take a moment)\n";
+    std::vector<double> all_latencies;
+    all_latencies.reserve(total_ops);
+    
+    for (int i = 0; i < config.num_threads; i++) {
+        // Only insert the actual recorded count
+        all_latencies.insert(all_latencies.end(), 
+                             metrics[i].latencies.begin(), 
+                             metrics[i].latencies.begin() + metrics[i].latency_count);
+    }
+    
+    std::sort(all_latencies.begin(), all_latencies.end());
+
+    double p50 = 0, p90 = 0, p99 = 0, p999 = 0, p100 = 0;
+    if (!all_latencies.empty()) {
+        p50 = all_latencies[total_ops * 0.50];
+        p90 = all_latencies[total_ops * 0.90];
+        p99 = all_latencies[total_ops * 0.99];
+        p999 = all_latencies[total_ops * 0.999];
+        p100 = all_latencies.back();
+    }
+    // --------------------------------------
+
+    std::cout << "\n[Phase 6] Running validation sweep...\n";
     uint64_t validation_success = 0;
     char val_buf[256];
     uint64_t val_size;
@@ -340,9 +371,13 @@ int main(int argc, char* argv[]) {
     std::cout << "Total Ops:     " << total_ops << "\n";
     std::cout << "Throughput:    " << std::fixed << std::setprecision(2) << ops_per_second << " ops/sec\n";
     std::cout << "Avg Latency:   " << avg_latency << " us\n";
-    std::cout << "Max Latency:   " << global_max_latency << " us (p100)\n";
+    std::cout << "P50 Latency:   " << p50 << " us\n";
+    std::cout << "P90 Latency:   " << p90 << " us\n";
+    std::cout << "P99 Latency:   " << p99 << " us\n";
+    std::cout << "P99.9 Latency: " << p999 << " us\n";
+    std::cout << "Max Latency:   " << p100 << " us (p100)\n";
     std::cout << "Reads/Updates: " << total_reads << " / " << total_updates << "\n";
-    if (total_corruptions > 0) std::cout << RED << "CORRUPTIONS:   " << total_corruptions << " detected!\n" << RESET;
+    if (total_corruptions > 0) std::cout << "\033[31mCORRUPTIONS:   " << total_corruptions << " detected!\n\033[0m";
     else std::cout << "CORRUPTIONS:   0 (Clean run!)\n";
     std::cout << "========================================================\n";
 

@@ -6,7 +6,7 @@ make benchmark
 
 # Define our output CSV file (saving it in the test folder)
 OUTPUT_CSV="./test/benchmark_results.csv"
-echo "Arena(MB),HotScale,AgeSpeed,Throughput,P100_us,Critical_State_%,Success_Rate_%,Hot_Rescued,Whole_Evictions,Partial_Evictions" > $OUTPUT_CSV
+echo "Arena(MB),HotScale,AgeSpeed,Throughput,P99_us,P99.9_us,P100_us,Critical_State_%,Success_Rate_%,Hot_Rescued,Whole_Evictions,Partial_Evictions" > $OUTPUT_CSV
 
 # Define the testing matrices
 ARENA_SIZES=(64)           # Start with 64MB
@@ -31,19 +31,23 @@ for mb in "${ARENA_SIZES[@]}"; do
             
             # Extract basic metrics
             THROUGHPUT=$(grep "Throughput:" ./test/temp_run.log | awk '{print $2}')
+            
+            # Extract Latencies
+            P99=$(grep "P99 Latency:" ./test/temp_run.log | awk '{print $3}')
+            P999=$(grep "P99.9 Latency:" ./test/temp_run.log | awk '{print $3}')
             P100=$(grep "Max Latency:" ./test/temp_run.log | awk '{print $3}')
+            
+            # Extract Status & Eviction Metrics
             CRITICAL=$(grep "Arena Critical State:" ./test/temp_run.log | awk '{print $4}' | tr -d '%')
             SUCCESS_RATE=$(grep "Eviction Success Rate:" ./test/temp_run.log | awk '{print $4}' | tr -d '%')
-            
-            # Extract Eviction Specifics
             HOT_RESCUED=$(grep "Hot rescued record:" ./test/temp_run.log | awk '{print $4}')
             WHOLE_EVICTED=$(grep "Whole page evicted count:" ./test/temp_run.log | awk '{print $5}')
             PARTIAL_EVICTED=$(grep "Partial page evicted count:" ./test/temp_run.log | awk '{print $5}')
             
             # Append to CSV
-            echo "$mb,$scale,$age,$THROUGHPUT,$P100,$CRITICAL,$SUCCESS_RATE,$HOT_RESCUED,$WHOLE_EVICTED,$PARTIAL_EVICTED" >> $OUTPUT_CSV
+            echo "$mb,$scale,$age,$THROUGHPUT,$P99,$P999,$P100,$CRITICAL,$SUCCESS_RATE,$HOT_RESCUED,$WHOLE_EVICTED,$PARTIAL_EVICTED" >> $OUTPUT_CSV
             
-            echo "  -> Done! Tput: $THROUGHPUT, Success: $SUCCESS_RATE%, Rescued: $HOT_RESCUED"
+            echo "  -> Done! Tput: $THROUGHPUT, P99: $P99 us, P100: $P100 us, Success: $SUCCESS_RATE%"
             ((CURRENT_TEST++))
             
             # Sleep for 5 seconds between runs to let the OS clear page caches & cool CPU
